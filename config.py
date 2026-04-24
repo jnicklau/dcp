@@ -25,3 +25,6 @@ PRICE_DATA_PATH = (
 
 # Train/test split
 TRAIN_SPLIT = 0.8
+
+# Lag steps for abwaerme (waste heat) temporal features: 15min, 1hr, 24hr, 1wk
+ABWAERME_LAG_STEPS = [4, 8, 12, 24, 96]

@@ -27,6 +27,8 @@ class StochasticOptimizer:
         steps_per_hour=4,
         n_scenarios=N_SCENARIOS,
         verbose=False,
+        dla_chol=None,
+        price_chol=None,
     ):
         self.capacity = battery_capacity
         self.max_power = max_power
@@ -36,6 +38,8 @@ class StochasticOptimizer:
         self.inv_sqrt_eff = 1.0 / self.sqrt_eff
         self.n_scenarios = n_scenarios
         self.verbose = verbose
+        self.dla_chol = dla_chol    # Cholesky of residual correlation matrix
+        self.price_chol = price_chol
 
     def optimize_single_scenario(
         self, prices, consumption, current_soc, discharge_allowed=False
@@ -91,13 +95,23 @@ class StochasticOptimizer:
         verbose=False,
     ):
         costs, all_soc, all_charge, all_discharge = [], [], [], []
+        n = len(price_mean)
         for _ in range(self.n_scenarios):
-            prices = np.clip(
-                price_mean + price_std * np.random.randn(len(price_mean)), 0.01, None
-            )
-            consumption = np.maximum(
-                dla_mean + dla_std * np.random.randn(len(dla_mean)), 0
-            )
+            # Sample correlated noise via Cholesky if available and dimensions match
+            if self.price_chol is not None and self.price_chol.shape[0] == n:
+                z = np.random.randn(n)
+                price_noise = price_std * (self.price_chol @ z)
+            else:
+                price_noise = price_std * np.random.randn(n)
+
+            if self.dla_chol is not None and self.dla_chol.shape[0] == n:
+                z = np.random.randn(n)
+                dla_noise = dla_std * (self.dla_chol @ z)
+            else:
+                dla_noise = dla_std * np.random.randn(n)
+
+            prices = np.clip(price_mean + price_noise, 0.01, None)
+            consumption = np.maximum(dla_mean + dla_noise, 0)
             result = self.optimize_single_scenario(
                 prices, consumption, current_soc, discharge_allowed=discharge_allowed
             )
@@ -125,6 +139,12 @@ def run_week_visualization(week_num=48):
     print("\n[1/7] Loading data...")
     merged = merge_datasets(FUNDIUM_DATA_PATH, PRICE_DATA_PATH)
 
+    # Pre-compute abwaerme lag features on the full dataset so lag-672 (1wk) is valid
+    for lag in ABWAERME_LAG_STEPS:
+        merged[f"abwaerme_lag_{lag}"] = (
+            merged["ofen_abwaerme_nestle_5893_mw"].shift(lag).ffill().bfill()
+        )
+
     train_size = int(len(merged) * TRAIN_SPLIT)
 
     start = pd.Timestamp("2023-01-01")
@@ -141,10 +161,11 @@ def run_week_visualization(week_num=48):
     print("\n[2/7] Loading models...")
     dla_input_dim = 6
     price_input_dim = 8
+    abwaerme_input_dim = 6 + len(ABWAERME_LAG_STEPS)
 
     dla_bnn = GaussianBNN(dla_input_dim, HIDDEN_DIMS)
     price_bnn = NormalizedBNN(price_input_dim, HIDDEN_DIMS)
-    abwaerme_bnn = GaussianBNN(dla_input_dim, HIDDEN_DIMS)
+    abwaerme_bnn = GaussianBNN(abwaerme_input_dim, HIDDEN_DIMS)
 
     dla_bnn.load_state_dict(torch.load("dla_bnn.pt", weights_only=True))
     price_bnn.load_state_dict(torch.load("price_bnn.pt", weights_only=True))
@@ -191,8 +212,15 @@ def run_week_visualization(week_num=48):
         batch_price, n_samples=NUM_MC_SAMPLES, price_min=price_min, price_max=price_max
     )
 
+    abwaerme_lag_cols = [f"abwaerme_lag_{lag}" for lag in ABWAERME_LAG_STEPS]
+    abwaerme_lag_feats = week_data[abwaerme_lag_cols].values  # (N, 4)
+    abwaerme_lag_feats_norm = (abwaerme_lag_feats - abwaerme_mean) / (abwaerme_std + 1e-8)
+    batch_abwaerme = torch.tensor(
+        np.hstack([time_feats, abwaerme_lag_feats_norm]), dtype=torch.float32
+    )
+
     abwaerme_mu_norm, abwaerme_sigma_norm, abwaerme_mu_std, _ = abwaerme_bnn.predict(
-        batch_dla, n_samples=NUM_MC_SAMPLES
+        batch_abwaerme, n_samples=NUM_MC_SAMPLES
     )
     abwaerme_mu = abwaerme_mu_norm * abwaerme_std + abwaerme_mean
     abwaerme_sigma = abwaerme_sigma_norm * abwaerme_std
@@ -238,6 +266,14 @@ def run_week_visualization(week_num=48):
 
     print("\n[5/7] Running stoch. optimization (discharge allowed)...")
 
+    # Load Cholesky factors for correlated scenario sampling
+    dla_chol = np.load("dla_chol.npz")["L"] if os.path.exists("dla_chol.npz") else None
+    price_chol = np.load("price_chol.npz")["L"] if os.path.exists("price_chol.npz") else None
+    if dla_chol is not None:
+        print("  Using Cholesky correlated sampling for DLA and price scenarios")
+    else:
+        print("  Using independent sampling (run train_simple.py to enable Cholesky)")
+
     optimizer = StochasticOptimizer(
         battery_capacity=BATTERY_CAPACITY_KWH,
         max_power=BATTERY_MAX_POWER_KW,
@@ -245,6 +281,8 @@ def run_week_visualization(week_num=48):
         horizon_hours=HORIZON_HOURS,
         n_scenarios=N_SCENARIOS,
         verbose=False,
+        dla_chol=dla_chol,
+        price_chol=price_chol,
     )
 
     current_soc = BATTERY_CAPACITY_KWH * 0.5

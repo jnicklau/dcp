@@ -152,6 +152,36 @@ def train_model_nll(
     return model, losses
 
 
+def estimate_residual_correlations(residuals, total_std, horizon_steps, ridge=1e-4):
+    """
+    Estimate the Cholesky factor of the residual correlation matrix over a horizon window.
+
+    Normalizes residuals by total_std to get a pure correlation structure,
+    builds overlapping windows of length horizon_steps, estimates the
+    correlation matrix, regularizes with a ridge, and returns L s.t. L @ L.T = C.
+    """
+    n = len(residuals)
+    norm_res = residuals / (total_std + 1e-8)  # shape (N,)
+
+    # Build overlapping windows: shape (n_windows, horizon_steps)
+    n_windows = n - horizon_steps + 1
+    windows = np.stack([norm_res[i : i + horizon_steps] for i in range(n_windows)])
+
+    # Estimate correlation matrix
+    C = np.cov(windows, rowvar=False)  # (horizon_steps, horizon_steps)
+
+    # Regularize: add ridge to ensure positive definiteness
+    C += ridge * np.eye(horizon_steps)
+
+    # Normalize to proper correlation matrix (diagonal = 1)
+    std_diag = np.sqrt(np.diag(C))
+    C = C / np.outer(std_diag, std_diag)
+    C += ridge * np.eye(horizon_steps)  # re-regularize after normalization
+
+    L = np.linalg.cholesky(C)
+    return L
+
+
 def calibrate_sigma(errors, std_dev, target_coverage=0.95):
     """Find scale factor to achieve target coverage using quantile matching"""
     abs_errors = np.abs(errors)
@@ -210,6 +240,12 @@ def prepare_data(merged_df):
         price_cols.std(axis=0) + 1e-8
     )
 
+    # Compute abwaerme lag features on the full series before splitting
+    # (avoids NaN gaps at the train/test boundary)
+    abwaerme_series = pd.Series(abwaerme_target)
+    lag_cols = [abwaerme_series.shift(lag).ffill().bfill().values for lag in ABWAERME_LAG_STEPS]
+    abwaerme_lags = np.column_stack(lag_cols)  # (N, len(ABWAERME_LAG_STEPS))
+
     train_size = int(len(merged_df) * TRAIN_SPLIT)
 
     return (
@@ -219,6 +255,7 @@ def prepare_data(merged_df):
             "dla_target": dla_target[:train_size],
             "price_target": price_target[:train_size],
             "abwaerme_target": abwaerme_target[:train_size],
+            "abwaerme_lags": abwaerme_lags[:train_size],
         },
         {
             "time": time_feats.values[train_size:],
@@ -226,6 +263,7 @@ def prepare_data(merged_df):
             "dla_target": dla_target[train_size:],
             "price_target": price_target[train_size:],
             "abwaerme_target": abwaerme_target[train_size:],
+            "abwaerme_lags": abwaerme_lags[train_size:],
         },
         train_size,
     )
@@ -291,13 +329,19 @@ def main():
     abwaerme_std = train_data["abwaerme_target"].std()
     abwaerme_train_norm = (train_data["abwaerme_target"] - abwaerme_mean) / abwaerme_std
 
+    # Normalize lag features using the same mean/std as the target
+    abwaerme_lags_norm = (train_data["abwaerme_lags"] - abwaerme_mean) / abwaerme_std
+    abwaerme_input = np.hstack([train_data["time"], abwaerme_lags_norm])
+    abwaerme_input_dim = 6 + len(ABWAERME_LAG_STEPS)
+    print(f"  Input dim: {abwaerme_input_dim} (6 time + {len(ABWAERME_LAG_STEPS)} lag features at steps {ABWAERME_LAG_STEPS})")
+
     abwaerme_dataset = TensorDataset(
-        torch.tensor(train_data["time"], dtype=torch.float32),
+        torch.tensor(abwaerme_input, dtype=torch.float32),
         torch.tensor(abwaerme_train_norm, dtype=torch.float32),
     )
     abwaerme_loader = DataLoader(abwaerme_dataset, batch_size=256, shuffle=True)
 
-    abwaerme_bnn = GaussianBNN(6, HIDDEN_DIMS, init_noise=0.5)
+    abwaerme_bnn = GaussianBNN(abwaerme_input_dim, HIDDEN_DIMS, init_noise=0.5)
     abwaerme_bnn, abwaerme_losses = train_model_nll(abwaerme_bnn, abwaerme_loader, name="Abwaerme BNN")
     torch.save(abwaerme_bnn.state_dict(), "abwaerme_bnn.pt")
     np.savez("abwaerme_norm.npz", mean=abwaerme_mean, std=abwaerme_std)
@@ -355,7 +399,9 @@ def main():
     print(f"  Coverage:  {price_metrics['coverage']:.1f}% (95% CI)")
     print(f"  Total Std: {price_metrics['total_std_mean']:.2f} EUR/MWh")
 
-    test_abwaerme_x = torch.tensor(test_data["time"], dtype=torch.float32)
+    test_abwaerme_lags_norm = (test_data["abwaerme_lags"] - abwaerme_mean) / abwaerme_std
+    test_abwaerme_input = np.hstack([test_data["time"], test_abwaerme_lags_norm])
+    test_abwaerme_x = torch.tensor(test_abwaerme_input, dtype=torch.float32)
     test_abwaerme_y = test_data["abwaerme_target"]
 
     abwaerme_mu_norm, abwaerme_sigma_norm, abwaerme_mu_std, _ = abwaerme_bnn.predict(
@@ -376,6 +422,36 @@ def main():
     print("\n" + "=" * 60)
     print("Training complete! Models saved.")
     print("=" * 60)
+
+    print("\n[Post-training] Estimating residual correlation matrices...")
+    horizon_steps = HORIZON_HOURS * OPTIMIZATION_STEPS_PER_HOUR
+
+    # DLA correlations on training data
+    train_dla_x = torch.tensor(train_data["time"], dtype=torch.float32)
+    dla_mu_tr_norm, dla_sigma_tr_norm, dla_mu_std_tr, _ = dla_bnn.predict(
+        train_dla_x, n_samples=NUM_MC_SAMPLES
+    )
+    dla_mu_tr = dla_mu_tr_norm * dla_std + dla_mean
+    dla_sigma_tr = dla_sigma_tr_norm * dla_std
+    dla_mu_std_tr = dla_mu_std_tr * dla_std
+    dla_total_std_tr = np.sqrt(dla_mu_std_tr**2 + dla_sigma_tr**2)
+    dla_residuals_tr = train_data["dla_target"] - dla_mu_tr
+    dla_chol = estimate_residual_correlations(dla_residuals_tr, dla_total_std_tr, horizon_steps)
+    np.savez("dla_chol.npz", L=dla_chol)
+    print(f"  DLA correlation matrix estimated from {len(dla_residuals_tr)} samples")
+
+    # Price correlations on training data
+    train_price_features = np.hstack([train_data["time"], train_data["price_cols"]])
+    train_price_x = torch.tensor(train_price_features, dtype=torch.float32)
+    price_mu_tr, price_sigma_tr, price_mu_std_tr, _ = price_bnn.predict_denormalized(
+        train_price_x, n_samples=NUM_MC_SAMPLES, price_min=price_min, price_max=price_max
+    )
+    price_total_std_tr = np.sqrt(price_mu_std_tr**2 + price_sigma_tr**2)
+    price_residuals_tr = train_data["price_target"] - price_mu_tr
+    price_chol = estimate_residual_correlations(price_residuals_tr, price_total_std_tr, horizon_steps)
+    np.savez("price_chol.npz", L=price_chol)
+    print(f"  Price correlation matrix estimated from {len(price_residuals_tr)} samples")
+    print("  Cholesky factors saved: dla_chol.npz, price_chol.npz")
 
 
 if __name__ == "__main__":
