@@ -11,6 +11,16 @@ from config import (
 
 
 class StochasticOptimizer:
+    """
+    Receding-horizon stochastic battery scheduler.
+
+    At each MPC step, N_SCENARIOS LP instances are solved over the look-ahead
+    horizon.  Scenarios are drawn from the BNN posterior predictive distributions,
+    optionally with Cholesky-correlated temporal noise.  Only the mean schedule
+    across all scenarios is returned; the caller commits the first OPT_FREQUENCY
+    steps before re-solving.
+    """
+
     def __init__(
         self,
         battery_capacity=BATTERY_CAPACITY_KWH,
@@ -34,26 +44,38 @@ class StochasticOptimizer:
         self.dla_chol = dla_chol    # Cholesky of residual correlation matrix
         self.price_chol = price_chol
 
+    # ── Single-scenario LP ────────────────────────────────────────────────────
+
     def optimize_single_scenario(
         self, prices, consumption, current_soc, discharge_allowed=False
     ):
+        """Solve one LP for a deterministic (price, consumption) scenario.
+
+        Objective: minimise total energy cost over the horizon.
+          cost = Σ price_t * (consumption_t + charge_t - discharge_t) / 1000
+
+        The round-trip efficiency η is split symmetrically as √η on each side:
+          energy stored  = charge   * √η
+          energy released = discharge / √η
+        """
         n = len(prices)
         charge = cp.Variable(n, nonneg=True)
         if discharge_allowed:
             discharge = cp.Variable(n, nonneg=True)
         soc = cp.Variable(n + 1, nonneg=True)
 
-        # consumption is kWh per interval, convert to MWh and multiply by price
+        # Baseline consumption cost (price × energy in MWh)
         cost = cp.sum(cp.multiply(prices, consumption / 1000))
-        # battery charging cost (energy * efficiency loss)
+        # Charging raises cost (buy electricity to store, incur efficiency loss)
         cost += cp.sum(cp.multiply(prices, charge / 1000)) * self.inv_sqrt_eff
         if discharge_allowed:
-            # battery discharging offset (just offsets consumption, no revenue)
+            # Discharging reduces cost (energy recovered from battery offsets grid draw)
             cost -= cp.sum(cp.multiply(prices, discharge / 1000)) * self.inv_sqrt_eff
 
+        # SOC dynamics: soc[t+1] = soc[t] + sqrt_eff*charge[t] - discharge[t]/sqrt_eff
         constraints = [soc[0] == current_soc, soc <= self.capacity]
         for t in range(n):
-            constraints.append(charge[t] <= self.max_power * 0.25)
+            constraints.append(charge[t] <= self.max_power * 0.25)  # 15-min power cap
             if discharge_allowed:
                 constraints.append(discharge[t] <= self.max_power * 0.25)
                 energy_delta = (
@@ -77,6 +99,8 @@ class StochasticOptimizer:
             else np.zeros(n),
         }
 
+    # ── Scenario sampling + averaging ─────────────────────────────────────────
+
     def stochastic_optimize(
         self,
         price_mean,
@@ -87,10 +111,16 @@ class StochasticOptimizer:
         discharge_allowed=False,
         verbose=False,
     ):
+        """Sample N_SCENARIOS futures, solve an LP for each, and average the schedules.
+
+        Correlated samples: z ~ N(0,I), noise = std * L @ z, where L is the lower
+        Cholesky factor of the residual correlation matrix estimated on training data.
+        Without a Cholesky factor, independent Gaussian noise is used instead.
+        """
         costs, all_soc, all_charge, all_discharge = [], [], [], []
         n = len(price_mean)
         for _ in range(self.n_scenarios):
-            # Sample correlated noise via Cholesky if available and dimensions match
+            # ── Draw temporally correlated noise ─────────────────────────────
             if self.price_chol is not None and self.price_chol.shape[0] == n:
                 z = np.random.randn(n)
                 price_noise = price_std * (self.price_chol @ z)
@@ -103,8 +133,8 @@ class StochasticOptimizer:
             else:
                 dla_noise = dla_std * np.random.randn(n)
 
-            # Clip to physically plausible bounds to prevent ECOS numerical failure
-            # (German day-ahead prices: historic range roughly -500 to 3000 EUR/MWh)
+            # Clip sampled prices to physical bounds; extreme outliers cause ECOS
+            # numerical failures (German day-ahead: historically −500 to 3000 EUR/MWh)
             prices = np.clip(price_mean + price_noise, -500.0, 3000.0)
 
             # # Consumption must be non-negative; cap at 5x the horizon mean as sanity bound

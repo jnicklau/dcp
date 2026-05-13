@@ -11,6 +11,11 @@ from data_loader import merge_datasets, get_time_features
 from config import *
 
 
+def denormalize(x_norm, mean, std):
+    """Convert a z-score normalized array back to original units."""
+    return x_norm * std + mean
+
+
 class GaussianMCDNet(nn.Module):
     """MC Dropout network predicting mean and aleatoric variance (Gaussian NLL head)"""
 
@@ -386,10 +391,12 @@ def prepare_data(merged_df):
 
     renewable = merged_df["renewable_gen_mw"].values
     load = merged_df["load_mw"].values
-    price_cols_raw = np.column_stack([renewable, load])
-    price_cols_mean = price_cols_raw.mean(axis=0)
-    price_cols_std  = price_cols_raw.std(axis=0)
-    price_cols = (price_cols_raw - price_cols_mean) / (price_cols_std + 1e-8)
+    # Renewable generation and grid load are the main market drivers for price.
+    # Saved as 'market_feats' and z-score normalised over the full dataset.
+    market_feats_raw = np.column_stack([renewable, load])
+    market_feats_mean = market_feats_raw.mean(axis=0)
+    market_feats_std  = market_feats_raw.std(axis=0)
+    market_feats = (market_feats_raw - market_feats_mean) / (market_feats_std + 1e-8)
 
     # Compute lag features on the full series before splitting
     # (avoids NaN gaps at the train/test boundary)
@@ -406,9 +413,9 @@ def prepare_data(merged_df):
     return (
         {
             "time": time_feats.values[:train_size],
-            "price_cols": price_cols[:train_size],
-            "price_cols_mean": price_cols_mean,
-            "price_cols_std": price_cols_std,
+            "market_feats": market_feats[:train_size],
+            "market_feats_mean": market_feats_mean,
+            "market_feats_std": market_feats_std,
             "dla_target": dla_target[:train_size],
             "dla_lags": dla_lags[:train_size],
             "price_target": price_target[:train_size],
@@ -418,7 +425,7 @@ def prepare_data(merged_df):
         },
         {
             "time": time_feats.values[train_size:],
-            "price_cols": price_cols[train_size:],
+            "market_feats": market_feats[train_size:],
             "dla_target": dla_target[train_size:],
             "dla_lags": dla_lags[train_size:],
             "price_target": price_target[train_size:],
@@ -455,7 +462,7 @@ def main():
     print(f"  price: mean={train_data['price_target'].mean():.1f} €/MWh, std={train_data['price_target'].std():.1f} €/MWh")
     print(f"  abwaerme: mean={train_data['abwaerme_target'].mean():.1f} MW, std={train_data['abwaerme_target'].std():.1f} MW")
 
-    print("\n[3/5] Training DLA BNN (Gaussian NLL in original space)...")
+    print(f"\n[3/5] Training DLA {UNCERTAINTY_METHOD} (Gaussian NLL in original space)...")
     dla_lags_norm = (train_data["dla_lags"] - dla_mean) / dla_std
     dla_input = np.hstack([train_data["time"], dla_lags_norm])
     dla_input_dim = 6 + len(DLA_LAG_STEPS)
@@ -468,17 +475,18 @@ def main():
     dla_loader = DataLoader(dla_dataset, batch_size=256, shuffle=True)
 
     dla_bnn = make_gaussian_net(dla_input_dim, HIDDEN_DIMS, init_noise=0.5)
-    dla_bnn, dla_losses = train_model_nll(dla_bnn, dla_loader, name="DLA BNN")
-    torch.save(dla_bnn.state_dict(), "dla_bnn.pt")
-    np.savez("dla_norm.npz", mean=dla_mean, std=dla_std)
+    dla_bnn, dla_losses = train_model_nll(dla_bnn, dla_loader, 
+                                          name=f"DLA {UNCERTAINTY_METHOD}")
+    torch.save(dla_bnn.state_dict(), f"{MODELS_DIR}/dla_bnn.pt")
+    np.savez(f"{NORMS_DIR}/dla_norm.npz", mean=dla_mean, std=dla_std)
 
-    print("\n[4/5] Training Price BNN (with renewable + load features)...")
+    print(f"\n[4/5] Training Price {UNCERTAINTY_METHOD} (with renewable + load features)...")
     price_min = train_data["price_target"].min()
     price_max = train_data["price_target"].max()
     price_targets = (train_data["price_target"] - price_min) / (price_max - price_min)
 
     price_lags_norm = (train_data["price_lags"] - price_min) / (price_max - price_min)
-    price_features = np.hstack([train_data["time"], train_data["price_cols"], price_lags_norm])
+    price_features = np.hstack([train_data["time"], train_data["market_feats"], price_lags_norm])
     price_input_dim = 8 + len(PRICE_LAG_STEPS)
     print(f"  Input dim: {price_input_dim} (8 time+market + {len(PRICE_LAG_STEPS)} lags at steps {PRICE_LAG_STEPS})")
 
@@ -489,18 +497,18 @@ def main():
     price_loader = DataLoader(price_dataset, batch_size=256, shuffle=True)
 
     price_bnn = make_normalized_net(price_input_dim, HIDDEN_DIMS, init_noise=0.1)
-    price_bnn, price_losses = train_model_nll(price_bnn, price_loader, name="Price BNN")
-    torch.save(price_bnn.state_dict(), "price_bnn.pt")
+    price_bnn, price_losses = train_model_nll(price_bnn, price_loader, name=f"Price {UNCERTAINTY_METHOD}")
+    torch.save(price_bnn.state_dict(), f"{MODELS_DIR}/price_bnn.pt")
     np.savez(
-        "price_norm.npz",
+        f"{NORMS_DIR}/price_norm.npz",
         price_min=price_min,
         price_max=price_max,
-        price_cols_mean=train_data["price_cols_mean"],
-        price_cols_std=train_data["price_cols_std"],
+        market_feats_mean=train_data["market_feats_mean"],
+        market_feats_std=train_data["market_feats_std"],
     )
     print(f"  Price range: [{price_min:.2f}, {price_max:.2f}] EUR/MWh")
 
-    print("\n[5/6] Training Abwaerme Nestle BNN...")
+    print(f"\n[5/6] Training Abwaerme {UNCERTAINTY_METHOD} BNN...")
     abwaerme_mean = train_data["abwaerme_target"].mean()
     abwaerme_std = train_data["abwaerme_target"].std()
     abwaerme_train_norm = (train_data["abwaerme_target"] - abwaerme_mean) / abwaerme_std
@@ -517,9 +525,9 @@ def main():
     abwaerme_loader = DataLoader(abwaerme_dataset, batch_size=256, shuffle=True)
 
     abwaerme_bnn = make_gaussian_net(abwaerme_input_dim, HIDDEN_DIMS, init_noise=0.3)
-    abwaerme_bnn, abwaerme_losses = train_model_nll(abwaerme_bnn, abwaerme_loader, name="Abwaerme BNN")
-    torch.save(abwaerme_bnn.state_dict(), "abwaerme_bnn.pt")
-    np.savez("abwaerme_norm.npz", mean=abwaerme_mean, std=abwaerme_std)
+    abwaerme_bnn, abwaerme_losses = train_model_nll(abwaerme_bnn, abwaerme_loader, name=f"Abwaerme {UNCERTAINTY_METHOD}")
+    torch.save(abwaerme_bnn.state_dict(), f"{MODELS_DIR}/abwaerme_bnn.pt")
+    np.savez(f"{NORMS_DIR}/abwaerme_norm.npz", mean=abwaerme_mean, std=abwaerme_std)
     print(f"  Abwaerme: mean={abwaerme_mean:.3f} MW, std={abwaerme_std:.3f} MW")
 
     print("\n[6/6] Plotting training losses...")
@@ -561,7 +569,7 @@ def main():
     print(f"  Total Std: {dla_metrics['total_std_mean']:.2f} kWh")
 
     test_price_lags_norm = (test_data["price_lags"] - price_min) / (price_max - price_min)
-    test_price_features = np.hstack([test_data["time"], test_data["price_cols"], test_price_lags_norm])
+    test_price_features = np.hstack([test_data["time"], test_data["market_feats"], test_price_lags_norm])
     test_price_x = torch.tensor(test_price_features, dtype=torch.float32)
     test_price_y = test_data["price_target"]
 
@@ -617,12 +625,12 @@ def main():
     dla_total_std_tr = np.sqrt(dla_mu_std_tr**2 + dla_sigma_tr**2)
     dla_residuals_tr = train_data["dla_target"] - dla_mu_tr
     dla_chol = estimate_residual_correlations(dla_residuals_tr, dla_total_std_tr, horizon_steps)
-    np.savez("dla_chol.npz", L=dla_chol)
+    np.savez(f"{NORMS_DIR}/dla_chol.npz", L=dla_chol)
     print(f"  DLA correlation matrix estimated from {len(dla_residuals_tr)} samples")
 
     # Price correlations on training data
     train_price_lags_norm = (train_data["price_lags"] - price_min) / (price_max - price_min)
-    train_price_features = np.hstack([train_data["time"], train_data["price_cols"], train_price_lags_norm])
+    train_price_features = np.hstack([train_data["time"], train_data["market_feats"], train_price_lags_norm])
     train_price_x = torch.tensor(train_price_features, dtype=torch.float32)
     price_mu_tr, price_sigma_tr, price_mu_std_tr, _ = price_bnn.predict_denormalized(
         train_price_x, n_samples=NUM_MC_SAMPLES, price_min=price_min, price_max=price_max
@@ -630,9 +638,9 @@ def main():
     price_total_std_tr = np.sqrt(price_mu_std_tr**2 + price_sigma_tr**2)
     price_residuals_tr = train_data["price_target"] - price_mu_tr
     price_chol = estimate_residual_correlations(price_residuals_tr, price_total_std_tr, horizon_steps)
-    np.savez("price_chol.npz", L=price_chol)
+    np.savez(f"{NORMS_DIR}/price_chol.npz", L=price_chol)
     print(f"  Price correlation matrix estimated from {len(price_residuals_tr)} samples")
-    print("  Cholesky factors saved: dla_chol.npz, price_chol.npz")
+    print(f"  Cholesky factors saved to {NORMS_DIR}/")
 
 
 if __name__ == "__main__":
