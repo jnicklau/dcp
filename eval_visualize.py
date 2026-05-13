@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from data_loader import merge_datasets, get_time_features
 from config import *
-from train_simple import make_gaussian_net, make_normalized_net, calculate_metrics, denormalize
+from train_simple import make_gaussian_net, calculate_metrics, denormalize
 from stoch_optimizer import StochasticOptimizer
 from plots import plot_predictions, plot_optimization
 
@@ -54,7 +54,7 @@ def load_models():
     abwaerme_input_dim = 6 + len(ABWAERME_LAG_STEPS)
 
     dla_bnn      = make_gaussian_net(dla_input_dim,      HIDDEN_DIMS, init_noise=0.5)
-    price_bnn    = make_normalized_net(price_input_dim,  HIDDEN_DIMS, init_noise=0.1)
+    price_bnn    = make_gaussian_net(price_input_dim,    HIDDEN_DIMS, init_noise=0.1)
     abwaerme_bnn = make_gaussian_net(abwaerme_input_dim, HIDDEN_DIMS, init_noise=0.3)
 
     dla_bnn.load_state_dict(torch.load(f"{MODELS_DIR}/dla_bnn.pt",      weights_only=True))
@@ -71,8 +71,8 @@ def load_models():
     norms = {
         "dla_mean":          float(dla_norm["mean"]),
         "dla_std":           float(dla_norm["std"]),
-        "price_min":         float(price_norm["price_min"]),
-        "price_max":         float(price_norm["price_max"]),
+        "price_mean":        float(price_norm["mean"]),
+        "price_std":         float(price_norm["std"]),
         "market_feats_mean": price_norm["market_feats_mean"],
         "market_feats_std":  price_norm["market_feats_std"],
         "abwaerme_mean":     float(abwaerme_norm["mean"]),
@@ -90,8 +90,8 @@ def make_predictions(week_data, dla_bnn, price_bnn, abwaerme_bnn, norms):
     Returns per-signal dicts with keys: mu, sigma (aleatoric), mu_std (epistemic),
     total_std, and actual (ground-truth values for the week).
     """
-    dla_mean  = norms["dla_mean"];  dla_std  = norms["dla_std"]
-    price_min = norms["price_min"]; price_max = norms["price_max"]
+    dla_mean  = norms["dla_mean"];   dla_std   = norms["dla_std"]
+    price_mean = norms["price_mean"]; price_std = norms["price_std"]
     abwaerme_mean = norms["abwaerme_mean"]; abwaerme_std = norms["abwaerme_std"]
 
     time_feats = get_time_features(week_data["new_time"]).values
@@ -112,12 +112,15 @@ def make_predictions(week_data, dla_bnn, price_bnn, abwaerme_bnn, norms):
 
     # ── Price ─────────────────────────────────────────────────────────────────
     price_lag_cols = [f"price_lag_{lag}" for lag in PRICE_LAG_STEPS]
-    price_lags_norm = (week_data[price_lag_cols].values - price_min) / (price_max - price_min + 1e-8)
+    price_lags_norm = (week_data[price_lag_cols].values - price_mean) / (price_std + 1e-8)
     batch_price = torch.tensor(np.hstack([time_feats, market_feats_norm, price_lags_norm]), dtype=torch.float32)
 
-    price_mu, price_sigma, price_mu_std, _ = price_bnn.predict_denormalized(
-        batch_price, n_samples=NUM_MC_SAMPLES, price_min=price_min, price_max=price_max
+    price_mu_norm, price_sigma_norm, price_mu_std_norm, _ = price_bnn.predict(
+        batch_price, n_samples=NUM_MC_SAMPLES
     )
+    price_mu     = denormalize(price_mu_norm,     price_mean, price_std)
+    price_sigma  = price_sigma_norm  * price_std
+    price_mu_std = price_mu_std_norm * price_std
 
     # ── Abwärme ───────────────────────────────────────────────────────────────
     abwaerme_lag_cols = [f"abwaerme_lag_{lag}" for lag in ABWAERME_LAG_STEPS]

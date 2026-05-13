@@ -72,70 +72,11 @@ class GaussianMCDNet(nn.Module):
         return mu_mean, sigma_mean, mu_std, sigma_std
 
 
-class NormalizedMCDNet(nn.Module):
-    """MC Dropout network for normalized targets [0,1] (e.g., price), sigmoid mean head"""
-
-    def __init__(self, input_dim, hidden_dims=[64, 32], init_noise=0.1):
-        super().__init__()
-
-        layers = []
-        prev_dim = input_dim
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, h_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.1))
-            prev_dim = h_dim
-
-        layers.append(nn.Linear(prev_dim, 2))
-        self.network = nn.Sequential(*layers)
-
-        with torch.no_grad():
-            self.network[-1].bias.data[1] = torch.tensor([init_noise])
-
-    def forward(self, x):
-        out = self.network(x)
-        mu = torch.sigmoid(out[:, 0])
-        log_var = out[:, 1].clamp(-5, 5)
-        sigma = torch.exp(0.5 * log_var) + 0.01
-        return mu, sigma
-
-    def nll_loss(self, x, y):
-        mu, sigma = self.forward(x)
-        return torch.mean(0.5 * torch.log(sigma**2) + (y - mu) ** 2 / (2 * sigma**2))
-
-    def predict(self, x, n_samples=NUM_MC_SAMPLES):
-        self.train()
-        mus = []
-        sigmas = []
-        with torch.no_grad():
-            for _ in range(n_samples):
-                mu, sigma = self.forward(x)
-                mus.append(mu)
-                sigmas.append(sigma)
-
-        mu_samples = torch.stack(mus).cpu().numpy()
-        sigma_samples = torch.stack(sigmas).cpu().numpy()
-
-        mu_mean = mu_samples.mean(axis=0)
-        mu_std = mu_samples.std(axis=0)
-        sigma_mean = sigma_samples.mean(axis=0)
-        sigma_std = sigma_samples.std(axis=0)
-
-        self.eval()
-        return mu_mean, sigma_mean, mu_std, sigma_std
-
-    def predict_denormalized(self, x, n_samples=NUM_MC_SAMPLES, price_min=0, price_max=1):
-        mu_norm, sigma_norm, mu_std, sigma_std = self.predict(x, n_samples)
-        price_range = price_max - price_min
-        mu_actual = mu_norm * price_range + price_min
-        sigma_actual = sigma_norm * price_range
-        mu_std_actual = mu_std * price_range
-        sigma_std_actual = sigma_std * price_range
-        return mu_actual, sigma_actual, mu_std_actual, sigma_std_actual
-
-
 class BayesLinear(nn.Module):
-    """Linear layer with learnable weight distributions (mean-field Gaussian posterior)."""
+    """
+    Linear layer with learnable weight distributions 
+    (mean-field Gaussian posterior).
+    """
 
     def __init__(self, in_features, out_features, prior_std=1.0):
         super().__init__()
@@ -212,71 +153,11 @@ class GaussianBNNNet(nn.Module):
         return mu_samples.mean(0), sigma_samples.mean(0), mu_samples.std(0), sigma_samples.std(0)
 
 
-class NormalizedBNNNet(nn.Module):
-    """True BNN (Bayes by Backprop) for normalized targets [0,1] (e.g., price), sigmoid mean head."""
-
-    def __init__(self, input_dim, hidden_dims=[64, 32], init_noise=0.1, prior_std=1.0):
-        super().__init__()
-        self.bayes_layers = nn.ModuleList()
-        self.activations = nn.ModuleList()
-        prev_dim = input_dim
-        for h_dim in hidden_dims:
-            self.bayes_layers.append(BayesLinear(prev_dim, h_dim, prior_std=prior_std))
-            self.activations.append(nn.ReLU())
-            prev_dim = h_dim
-        self.output_layer = BayesLinear(prev_dim, 2, prior_std=prior_std)
-        with torch.no_grad():
-            self.output_layer.b_mu.data[1] = init_noise
-
-    def forward(self, x):
-        for layer, act in zip(self.bayes_layers, self.activations):
-            x = act(layer(x))
-        out = self.output_layer(x)
-        mu = torch.sigmoid(out[:, 0])
-        log_var = out[:, 1].clamp(-5, 5)
-        sigma = torch.exp(0.5 * log_var) + 0.01
-        return mu, sigma
-
-    def kl_divergence(self):
-        return sum(l.kl_divergence() for l in self.bayes_layers) + self.output_layer.kl_divergence()
-
-    def nll_loss(self, x, y, dataset_size=1):
-        mu, sigma = self.forward(x)
-        nll = torch.mean(0.5 * torch.log(sigma**2) + (y - mu)**2 / (2 * sigma**2))
-        return nll + self.kl_divergence() / dataset_size
-
-    def predict(self, x, n_samples=NUM_MC_SAMPLES):
-        self.train()
-        mus, sigmas = [], []
-        with torch.no_grad():
-            for _ in range(n_samples):
-                mu, sigma = self.forward(x)
-                mus.append(mu)
-                sigmas.append(sigma)
-        mu_samples = torch.stack(mus).cpu().numpy()
-        sigma_samples = torch.stack(sigmas).cpu().numpy()
-        self.eval()
-        return mu_samples.mean(0), sigma_samples.mean(0), mu_samples.std(0), sigma_samples.std(0)
-
-    def predict_denormalized(self, x, n_samples=NUM_MC_SAMPLES, price_min=0, price_max=1):
-        mu_norm, sigma_norm, mu_std, sigma_std = self.predict(x, n_samples)
-        price_range = price_max - price_min
-        return (mu_norm * price_range + price_min, sigma_norm * price_range,
-                mu_std * price_range, sigma_std * price_range)
-
-
 def make_gaussian_net(input_dim, hidden_dims, init_noise):
     """Instantiate Gaussian output network based on UNCERTAINTY_METHOD config."""
     if UNCERTAINTY_METHOD == "bnn":
         return GaussianBNNNet(input_dim, hidden_dims, init_noise=init_noise)
     return GaussianMCDNet(input_dim, hidden_dims, init_noise=init_noise)
-
-
-def make_normalized_net(input_dim, hidden_dims, init_noise):
-    """Instantiate normalized output network based on UNCERTAINTY_METHOD config."""
-    if UNCERTAINTY_METHOD == "bnn":
-        return NormalizedBNNNet(input_dim, hidden_dims, init_noise=init_noise)
-    return NormalizedMCDNet(input_dim, hidden_dims, init_noise=init_noise)
 
 
 def train_model_nll(
@@ -481,11 +362,11 @@ def main():
     np.savez(f"{NORMS_DIR}/dla_norm.npz", mean=dla_mean, std=dla_std)
 
     print(f"\n[4/5] Training Price {UNCERTAINTY_METHOD} (with renewable + load features)...")
-    price_min = train_data["price_target"].min()
-    price_max = train_data["price_target"].max()
-    price_targets = (train_data["price_target"] - price_min) / (price_max - price_min)
+    price_mean = train_data["price_target"].mean()
+    price_std  = train_data["price_target"].std()
+    price_targets = (train_data["price_target"] - price_mean) / price_std
 
-    price_lags_norm = (train_data["price_lags"] - price_min) / (price_max - price_min)
+    price_lags_norm = (train_data["price_lags"] - price_mean) / price_std
     price_features = np.hstack([train_data["time"], train_data["market_feats"], price_lags_norm])
     price_input_dim = 8 + len(PRICE_LAG_STEPS)
     print(f"  Input dim: {price_input_dim} (8 time+market + {len(PRICE_LAG_STEPS)} lags at steps {PRICE_LAG_STEPS})")
@@ -496,19 +377,19 @@ def main():
     )
     price_loader = DataLoader(price_dataset, batch_size=256, shuffle=True)
 
-    price_bnn = make_normalized_net(price_input_dim, HIDDEN_DIMS, init_noise=0.1)
+    price_bnn = make_gaussian_net(price_input_dim, HIDDEN_DIMS, init_noise=0.1)
     price_bnn, price_losses = train_model_nll(price_bnn, price_loader, name=f"Price {UNCERTAINTY_METHOD}")
     torch.save(price_bnn.state_dict(), f"{MODELS_DIR}/price_bnn.pt")
     np.savez(
         f"{NORMS_DIR}/price_norm.npz",
-        price_min=price_min,
-        price_max=price_max,
+        mean=price_mean,
+        std=price_std,
         market_feats_mean=train_data["market_feats_mean"],
         market_feats_std=train_data["market_feats_std"],
     )
-    print(f"  Price range: [{price_min:.2f}, {price_max:.2f}] EUR/MWh")
+    print(f"  Price: mean={price_mean:.2f} EUR/MWh, std={price_std:.2f} EUR/MWh")
 
-    print(f"\n[5/6] Training Abwaerme {UNCERTAINTY_METHOD} BNN...")
+    print(f"\n[5/6] Training Abwaerme {UNCERTAINTY_METHOD}...")
     abwaerme_mean = train_data["abwaerme_target"].mean()
     abwaerme_std = train_data["abwaerme_target"].std()
     abwaerme_train_norm = (train_data["abwaerme_target"] - abwaerme_mean) / abwaerme_std
@@ -568,14 +449,17 @@ def main():
     print(f"  Coverage:  {dla_metrics['coverage']:.1f}% (95% CI)")
     print(f"  Total Std: {dla_metrics['total_std_mean']:.2f} kWh")
 
-    test_price_lags_norm = (test_data["price_lags"] - price_min) / (price_max - price_min)
+    test_price_lags_norm = (test_data["price_lags"] - price_mean) / price_std
     test_price_features = np.hstack([test_data["time"], test_data["market_feats"], test_price_lags_norm])
     test_price_x = torch.tensor(test_price_features, dtype=torch.float32)
     test_price_y = test_data["price_target"]
 
-    price_mu, price_sigma, price_mu_std, _ = price_bnn.predict_denormalized(
-        test_price_x, n_samples=NUM_MC_SAMPLES, price_min=price_min, price_max=price_max
+    price_mu_norm, price_sigma_norm, price_mu_std_norm, _ = price_bnn.predict(
+        test_price_x, n_samples=NUM_MC_SAMPLES
     )
+    price_mu     = denormalize(price_mu_norm,     price_mean, price_std)
+    price_sigma  = price_sigma_norm  * price_std
+    price_mu_std = price_mu_std_norm * price_std
 
     price_metrics = calculate_metrics(test_price_y, price_mu, price_mu_std, price_sigma)
     print("\nPrice Day-Ahead Test Metrics:")
@@ -629,12 +513,15 @@ def main():
     print(f"  DLA correlation matrix estimated from {len(dla_residuals_tr)} samples")
 
     # Price correlations on training data
-    train_price_lags_norm = (train_data["price_lags"] - price_min) / (price_max - price_min)
+    train_price_lags_norm = (train_data["price_lags"] - price_mean) / price_std
     train_price_features = np.hstack([train_data["time"], train_data["market_feats"], train_price_lags_norm])
     train_price_x = torch.tensor(train_price_features, dtype=torch.float32)
-    price_mu_tr, price_sigma_tr, price_mu_std_tr, _ = price_bnn.predict_denormalized(
-        train_price_x, n_samples=NUM_MC_SAMPLES, price_min=price_min, price_max=price_max
+    price_mu_tr_norm, price_sigma_tr_norm, price_mu_std_tr_norm, _ = price_bnn.predict(
+        train_price_x, n_samples=NUM_MC_SAMPLES
     )
+    price_mu_tr     = denormalize(price_mu_tr_norm,     price_mean, price_std)
+    price_sigma_tr  = price_sigma_tr_norm  * price_std
+    price_mu_std_tr = price_mu_std_tr_norm * price_std
     price_total_std_tr = np.sqrt(price_mu_std_tr**2 + price_sigma_tr**2)
     price_residuals_tr = train_data["price_target"] - price_mu_tr
     price_chol = estimate_residual_correlations(price_residuals_tr, price_total_std_tr, horizon_steps)
