@@ -85,11 +85,12 @@ def run_week_visualization(week_num=48):
     print("\n[3/7] Making predictions...")
     time_feats = get_time_features(week_data["new_time"]).values
 
+    price_cols_mean = price_norm["price_cols_mean"]
+    price_cols_std  = price_norm["price_cols_std"]
+
     renewable = week_data["renewable_gen_mw"].values
     load = week_data["load_mw"].values
     price_cols = np.column_stack([renewable, load])
-    price_cols_mean = price_cols[:1000].mean(axis=0)
-    price_cols_std = price_cols[:1000].std(axis=0)
     price_cols_norm = (price_cols - price_cols_mean) / (price_cols_std + 1e-8)
 
     # DLA input: time features + normalized DLA lags

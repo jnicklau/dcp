@@ -193,7 +193,8 @@ class GaussianBNNNet(nn.Module):
         return nll + self.kl_divergence() / dataset_size
 
     def predict(self, x, n_samples=NUM_MC_SAMPLES):
-        # self.train() not needed for true BNN since weights are sampled in forward pass
+        # not needed for true BNN since weights are sampled in forward pass
+        self.train() 
         mus, sigmas = [], []
         with torch.no_grad():
             for _ in range(n_samples):
@@ -202,7 +203,7 @@ class GaussianBNNNet(nn.Module):
                 sigmas.append(sigma)
         mu_samples = torch.stack(mus).cpu().numpy()
         sigma_samples = torch.stack(sigmas).cpu().numpy()
-        # self.eval() not needed for true BNN since no dropout 
+        self.eval() # not needed for true BNN since no dropout 
         return mu_samples.mean(0), sigma_samples.mean(0), mu_samples.std(0), sigma_samples.std(0)
 
 
@@ -385,11 +386,10 @@ def prepare_data(merged_df):
 
     renewable = merged_df["renewable_gen_mw"].values
     load = merged_df["load_mw"].values
-    price_cols = np.column_stack([renewable, load])
-
-    price_cols = (price_cols - price_cols.mean(axis=0)) / (
-        price_cols.std(axis=0) + 1e-8
-    )
+    price_cols_raw = np.column_stack([renewable, load])
+    price_cols_mean = price_cols_raw.mean(axis=0)
+    price_cols_std  = price_cols_raw.std(axis=0)
+    price_cols = (price_cols_raw - price_cols_mean) / (price_cols_std + 1e-8)
 
     # Compute lag features on the full series before splitting
     # (avoids NaN gaps at the train/test boundary)
@@ -407,6 +407,8 @@ def prepare_data(merged_df):
         {
             "time": time_feats.values[:train_size],
             "price_cols": price_cols[:train_size],
+            "price_cols_mean": price_cols_mean,
+            "price_cols_std": price_cols_std,
             "dla_target": dla_target[:train_size],
             "dla_lags": dla_lags[:train_size],
             "price_target": price_target[:train_size],
@@ -489,7 +491,13 @@ def main():
     price_bnn = make_normalized_net(price_input_dim, HIDDEN_DIMS, init_noise=0.1)
     price_bnn, price_losses = train_model_nll(price_bnn, price_loader, name="Price BNN")
     torch.save(price_bnn.state_dict(), "price_bnn.pt")
-    np.savez("price_norm.npz", price_min=price_min, price_max=price_max)
+    np.savez(
+        "price_norm.npz",
+        price_min=price_min,
+        price_max=price_max,
+        price_cols_mean=train_data["price_cols_mean"],
+        price_cols_std=train_data["price_cols_std"],
+    )
     print(f"  Price range: [{price_min:.2f}, {price_max:.2f}] EUR/MWh")
 
     print("\n[5/6] Training Abwaerme Nestle BNN...")

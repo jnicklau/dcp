@@ -61,7 +61,7 @@ class StochasticOptimizer:
                 )
             else:
                 energy_delta = charge[t] * self.sqrt_eff
-            constraints.append(soc[t + 1] == soc[t] - energy_delta)
+            constraints.append(soc[t + 1] == soc[t] + energy_delta)
 
         problem = cp.Problem(cp.Minimize(cost), constraints)
         problem.solve(solver=cp.ECOS, verbose=False)
@@ -103,8 +103,15 @@ class StochasticOptimizer:
             else:
                 dla_noise = dla_std * np.random.randn(n)
 
-            prices = np.clip(price_mean + price_noise, 0.01, None)
-            consumption = np.maximum(dla_mean + dla_noise, 0)
+            # Clip to physically plausible bounds to prevent ECOS numerical failure
+            # (German day-ahead prices: historic range roughly -500 to 3000 EUR/MWh)
+            prices = np.clip(price_mean + price_noise, -500.0, 3000.0)
+
+            # # Consumption must be non-negative; cap at 5x the horizon mean as sanity bound
+            # max_consumption = max(np.mean(dla_mean) * 5, 1.0)
+            # consumption = np.clip(dla_mean + dla_noise, 0.0, max_consumption)
+            consumption = dla_mean + dla_noise
+
             result = self.optimize_single_scenario(
                 prices, consumption, current_soc, discharge_allowed=discharge_allowed
             )

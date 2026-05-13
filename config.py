@@ -14,11 +14,13 @@ OPT_FREQUENCY = 3*4  # Optimize every 12 hours (48 steps)
 # Model hyperparameters
 HIDDEN_DIMS = [64, 64, 32]
 LEARNING_RATE = 1e-3
-NUM_EPOCHS = 50
+NUM_EPOCHS = 10
 NUM_MC_SAMPLES = 50
 
-# Uncertainty method: "mcd" = MC Dropout, "bnn" = Bayes by Backprop (true BNN)
-UNCERTAINTY_METHOD = "bnn"
+# Uncertainty method: 
+#   "mcd" = MC Dropout, 
+#   "bnn" = Bayes by Backprop (true BNN)
+UNCERTAINTY_METHOD = "mcd"
 
 
 # Data paths
