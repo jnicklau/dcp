@@ -14,13 +14,24 @@ class StochasticOptimizer:
     """
     Receding-horizon stochastic battery scheduler.
 
-    Scenarios are drawn from the BNN posterior predictive distributions,
-    optionally with Cholesky-correlated temporal noise.  Three optimisation
-    modes are available (see stochastic_optimize for details):
+    Primary public API
+    ------------------
+    sample_scenarios(price_mean, price_std, dla_mean, dla_std)
+        Draw N_SCENARIOS (prices, consumption) tuples using the Cholesky-correlated
+        Gaussian sampler.  Returns a plain list so any external source of scenarios
+        (normalizing flows, ensemble models, expert draws, …) can be used instead.
 
-      "extensive"     — correct stochastic programming (recommended)
-      "mean_scenario" — single deterministic LP on expected inputs (fastest)
-      "scenario_avg"  — independent LPs averaged post-hoc (legacy)
+    optimize(scenarios, current_soc, discharge_allowed, mode)
+        Solve the battery scheduling LP given a list of (prices, consumption) tuples.
+        Three modes:
+          "extensive"     — correct stochastic programming (recommended)
+          "mean_scenario" — single LP on scenario means (fastest)
+          "scenario_avg"  — independent LP per scenario, schedules averaged (legacy)
+
+    Convenience wrapper
+    -------------------
+    optimize_from_stats(price_mean, price_std, dla_mean, dla_std, ...)
+        Calls sample_scenarios then optimize — preserves the original interface.
     """
 
     def __init__(
@@ -101,42 +112,66 @@ class StochasticOptimizer:
             else np.zeros(n),
         }
 
-    # ── Scenario sampling + averaging ─────────────────────────────────────────
+    # ── Public scenario sampling ───────────────────────────────────────────────
 
-    def stochastic_optimize(
-        self,
-        price_mean,
-        price_std,
-        dla_mean,
-        dla_std,
-        current_soc,
-        discharge_allowed=False,
-        verbose=False,
-        mode="extensive",
-    ):
-        """Solve the stochastic battery scheduling problem.
+    def sample_scenarios(self, price_mean, price_std, dla_mean, dla_std):
+        """Draw self.n_scenarios (prices, consumption) pairs with correlated noise.
+
+        Returns
+        -------
+        list of (prices, consumption) tuples, each a 1-D numpy array of length
+        horizon_steps.  Any external scenario source can produce the same format.
+        """
+        return self._draw_scenarios(price_mean, price_std, dla_mean, dla_std)
+
+    # ── Primary optimizer ─────────────────────────────────────────────────────
+
+    def optimize(self, scenarios, current_soc, discharge_allowed=False, mode="extensive"):
+        """Solve the battery scheduling problem given a list of scenarios.
 
         Parameters
         ----------
+        scenarios : list of (prices, consumption) tuples
+            Each tuple contains two 1-D arrays of length horizon_steps.
+            Produced by sample_scenarios() or any external source.
+        current_soc : float
+            Battery state of charge at the start of the horizon (kWh).
         mode : {"extensive", "mean_scenario", "scenario_avg"}
-            "extensive"    — Single extensive-form LP: all scenarios share one
-                             first-stage schedule (correct stochastic programming).
-            "mean_scenario" — Single deterministic LP solved on (price_mean, dla_mean).
-                             Fastest; equivalent to EV scheduling. --> !!!different for correlated noise!!!
-            "scenario_avg" — Solve one LP per scenario independently, then average
-                             the resulting schedules. Fast but theoretically equivalent
-                             to "mean_scenario" for linear objectives.
+            "extensive"     — All scenarios share one first-stage schedule;
+                              per-scenario SOC constraints enforced (recommended).
+            "mean_scenario" — Single LP on the mean of the provided scenarios.
+            "scenario_avg"  — Independent LP per scenario, schedules averaged (legacy).
         """
         if mode == "extensive":
-            return self._extensive_form(price_mean, price_std, dla_mean, dla_std,
-                                        current_soc, discharge_allowed)
+            return self._extensive_form(scenarios, current_soc, discharge_allowed)
         elif mode == "mean_scenario":
-            return self._mean_scenario(price_mean, dla_mean, current_soc, discharge_allowed)
+            prices_mean = np.mean([s[0] for s in scenarios], axis=0)
+            dla_mean    = np.mean([s[1] for s in scenarios], axis=0)
+            return self._mean_scenario(prices_mean, dla_mean, current_soc, discharge_allowed)
         elif mode == "scenario_avg":
-            return self._scenario_avg(price_mean, price_std, dla_mean, dla_std,
-                                      current_soc, discharge_allowed)
+            return self._scenario_avg(scenarios, current_soc, discharge_allowed)
         else:
             raise ValueError(f"Unknown mode '{mode}'. Choose 'extensive', 'mean_scenario', or 'scenario_avg'.")
+
+    # ── Convenience wrapper (backwards compatible) ────────────────────────────
+
+    def optimize_from_stats(
+        self, price_mean, price_std, dla_mean, dla_std,
+        current_soc, discharge_allowed=False, mode="extensive",
+    ):
+        """Sample scenarios from mean/std then optimize — preserves original interface."""
+        scenarios = self.sample_scenarios(price_mean, price_std, dla_mean, dla_std)
+        return self.optimize(scenarios, current_soc, discharge_allowed, mode)
+
+    def stochastic_optimize(
+        self, price_mean, price_std, dla_mean, dla_std,
+        current_soc, discharge_allowed=False, verbose=False, mode="extensive",
+    ):
+        """Deprecated convenience wrapper — use optimize_from_stats() instead."""
+        return self.optimize_from_stats(
+            price_mean, price_std, dla_mean, dla_std,
+            current_soc, discharge_allowed, mode,
+        )
 
     # ── Mode implementations ──────────────────────────────────────────────────
 
@@ -175,10 +210,8 @@ class StochasticOptimizer:
             "avg_discharge": result["discharge"],
         }
 
-    def _scenario_avg(self, price_mean, price_std, dla_mean, dla_std,
-                      current_soc, discharge_allowed):
+    def _scenario_avg(self, scenarios, current_soc, discharge_allowed):
         """Solve one LP per scenario independently, then average schedules."""
-        scenarios = self._draw_scenarios(price_mean, price_std, dla_mean, dla_std)
         costs, all_soc, all_charge, all_discharge = [], [], [], []
         for prices, consumption in scenarios:
             result = self.optimize_single_scenario(
@@ -199,8 +232,7 @@ class StochasticOptimizer:
             "avg_discharge": np.mean(all_discharge, axis=0),
         }
 
-    def _extensive_form(self, price_mean, price_std, dla_mean, dla_std,
-                        current_soc, discharge_allowed):
+    def _extensive_form(self, scenarios, current_soc, discharge_allowed):
         """Extensive-form stochastic LP.
 
         All scenarios share a single first-stage schedule (charge/discharge for
@@ -214,9 +246,8 @@ class StochasticOptimizer:
           per-scenario SOC dynamics and capacity bounds
           shared power limits on charge / discharge
         """
-        scenarios = self._draw_scenarios(price_mean, price_std, dla_mean, dla_std)
         S = len(scenarios)
-        n = len(price_mean)
+        n = len(scenarios[0][0])
 
         # First-stage (shared) decision variables
         charge = cp.Variable(n, nonneg=True)

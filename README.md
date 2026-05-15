@@ -132,9 +132,14 @@ All tunable parameters live in `config.py`. Key switches:
 | `UNCERTAINTY_METHOD` | `"mcd"`, `"bnn"` | Epistemic uncertainty method |
 | `SCENARIO_METHOD` | `"cholesky_decomp_corr"` | Scenario sampling method |
 | `SO_MODE` | `"extensive"`, `"scenario_avg"`, `"mean_scenario"` | Optimisation mode (see below) |
-| `HORIZON_HOURS` | `12` | MPC look-ahead window |
+| `HORIZON_HOURS` | `12` | MPC look-ahead window in hours |
 | `N_SCENARIOS` | `10` | Scenarios per LP solve |
-| `OPT_FREQUENCY` | `12` | Steps committed per MPC iteration (3 h) |
+| `OPT_FREQUENCY` | `12` | Steps committed per MPC iteration (3 h = 12 * 4 (four 15min intervals per hour)) |
+
+
+# Lag features
+
+All three signals use lags at 48, 96, and 672 steps (12 h, 24 h, 1 week) to capture diurnal and weekly seasonality. Configured via `DLA_LAG_STEPS`, `PRICE_LAG_STEPS`, `ABWAERME_LAG_STEPS` in `config.py`.
 
 ### Optimisation modes
 
@@ -146,6 +151,45 @@ All tunable parameters live in `config.py`. Key switches:
 
 ---
 
-## Lag features
+## Using the optimizer with external scenarios
 
-All three signals use lags at **48, 96, and 672 steps** (12 h, 24 h, 1 week) to capture diurnal and weekly seasonality. Configured via `DLA_LAG_STEPS`, `PRICE_LAG_STEPS`, `ABWAERME_LAG_STEPS` in `config.py`.
+The optimizer is designed so that scenario generation and scheduling are fully decoupled. You do not need BNN forecasts to use the LP — any source of (price, consumption) trajectories works.
+
+### Public API
+
+```python
+from stoch_optimizer import StochasticOptimizer
+
+opt = StochasticOptimizer(battery_capacity=500, max_power=100, efficiency=0.9)
+
+# --- Option A: bring your own scenarios ---
+# Each scenario is a tuple (prices, consumption), both 1-D arrays of length horizon_steps.
+my_scenarios = [
+    (price_array_1, consumption_array_1),
+    (price_array_2, consumption_array_2),
+    ...
+]
+result = opt.optimize(my_scenarios, current_soc=250.0, discharge_allowed=True, mode="extensive")
+
+# --- Option B: sample from BNN mean/std (built-in Cholesky sampler) ---
+scenarios = opt.sample_scenarios(price_mean, price_std, dla_mean, dla_std)
+result = opt.optimize(scenarios, current_soc=250.0)
+
+# --- Option C: one-liner convenience wrapper ---
+result = opt.optimize_from_stats(price_mean, price_std, dla_mean, dla_std, current_soc=250.0)
+```
+
+`result` always has the same structure regardless of which path was taken:
+
+```python
+{
+    "expected_cost":  float,         # mean cost across scenarios (EUR)
+    "cost_std":       float,         # std of costs across scenarios
+    "avg_soc":        np.ndarray,    # SOC trajectory, shape (horizon_steps+1,)
+    "avg_charge":     np.ndarray,    # charge schedule, shape (horizon_steps,)
+    "avg_discharge":  np.ndarray,    # discharge schedule, shape (horizon_steps,)
+}
+```
+
+---
+

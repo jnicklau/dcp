@@ -189,15 +189,13 @@ def run_optimization(preds):
     n_steps = len(price_mu) - optimizer.horizon_steps
 
     for i in tqdm(range(0, n_steps, OPT_FREQUENCY), desc="Optimizing"):
-        opt_result = optimizer.stochastic_optimize(
+        scenarios = optimizer.sample_scenarios(
             price_mu[i : i + optimizer.horizon_steps],
             price_std[i : i + optimizer.horizon_steps],
             dla_mu[i : i + optimizer.horizon_steps],
             dla_std[i : i + optimizer.horizon_steps],
-            current_soc,
-            discharge_allowed=True,
-            mode=SO_MODE,  # "extensive" or "scenario_avg" for better uncertainty handling (but slower)
         )
+        opt_result = optimizer.optimize(scenarios, current_soc, discharge_allowed=True, mode=SO_MODE)
         if opt_result:
             results.append(opt_result)
             result_times.append(i)
