@@ -21,7 +21,8 @@ BATTERY_ROUND_TRIP_EFFICIENCY = 0.90
 HORIZON_HOURS = 12                          # look-ahead window for the LP
 OPTIMIZATION_STEPS_PER_HOUR = 4            # 15-minute intervals
 N_SCENARIOS = 10                            # Monte-Carlo scenarios per LP solve
-OPT_FREQUENCY = 3 * 4                      # re-optimize every 3 hours (12 steps)
+OPT_FREQUENCY = 3 *4                    # re-optimize every 3 hours (12 steps)
+SO_MODE = "scenario_avg"                      # "extensive" or "scenario_avg" for better uncertainty handling (but slower)
 
 # ── Model hyperparameters ─────────────────────────────────────────────────────
 HIDDEN_DIMS = [64, 64, 32]                 # BNN / MC-Dropout hidden layer sizes

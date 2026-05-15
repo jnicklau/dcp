@@ -196,6 +196,7 @@ def run_optimization(preds):
             dla_std[i : i + optimizer.horizon_steps],
             current_soc,
             discharge_allowed=True,
+            mode=SO_MODE,  # "extensive" or "scenario_avg" for better uncertainty handling (but slower)
         )
         if opt_result:
             results.append(opt_result)

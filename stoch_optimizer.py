@@ -14,11 +14,13 @@ class StochasticOptimizer:
     """
     Receding-horizon stochastic battery scheduler.
 
-    At each MPC step, N_SCENARIOS LP instances are solved over the look-ahead
-    horizon.  Scenarios are drawn from the BNN posterior predictive distributions,
-    optionally with Cholesky-correlated temporal noise.  Only the mean schedule
-    across all scenarios is returned; the caller commits the first OPT_FREQUENCY
-    steps before re-solving.
+    Scenarios are drawn from the BNN posterior predictive distributions,
+    optionally with Cholesky-correlated temporal noise.  Three optimisation
+    modes are available (see stochastic_optimize for details):
+
+      "extensive"     — correct stochastic programming (recommended)
+      "mean_scenario" — single deterministic LP on expected inputs (fastest)
+      "scenario_avg"  — independent LPs averaged post-hoc (legacy)
     """
 
     def __init__(
@@ -110,40 +112,77 @@ class StochasticOptimizer:
         current_soc,
         discharge_allowed=False,
         verbose=False,
+        mode="extensive",
     ):
-        """Sample N_SCENARIOS futures, solve an LP for each, and average the schedules.
+        """Solve the stochastic battery scheduling problem.
 
-        Correlated samples: z ~ N(0,I), noise = std * L @ z, where L is the lower
-        Cholesky factor of the residual correlation matrix estimated on training data.
-        Without a Cholesky factor, independent Gaussian noise is used instead.
+        Parameters
+        ----------
+        mode : {"extensive", "mean_scenario", "scenario_avg"}
+            "extensive"    — Single extensive-form LP: all scenarios share one
+                             first-stage schedule (correct stochastic programming).
+            "mean_scenario" — Single deterministic LP solved on (price_mean, dla_mean).
+                             Fastest; equivalent to EV scheduling. --> !!!different for correlated noise!!!
+            "scenario_avg" — Solve one LP per scenario independently, then average
+                             the resulting schedules. Fast but theoretically equivalent
+                             to "mean_scenario" for linear objectives.
         """
-        costs, all_soc, all_charge, all_discharge = [], [], [], []
+        if mode == "extensive":
+            return self._extensive_form(price_mean, price_std, dla_mean, dla_std,
+                                        current_soc, discharge_allowed)
+        elif mode == "mean_scenario":
+            return self._mean_scenario(price_mean, dla_mean, current_soc, discharge_allowed)
+        elif mode == "scenario_avg":
+            return self._scenario_avg(price_mean, price_std, dla_mean, dla_std,
+                                      current_soc, discharge_allowed)
+        else:
+            raise ValueError(f"Unknown mode '{mode}'. Choose 'extensive', 'mean_scenario', or 'scenario_avg'.")
+
+    # ── Mode implementations ──────────────────────────────────────────────────
+
+    def _draw_scenarios(self, price_mean, price_std, dla_mean, dla_std):
+        """Draw self.n_scenarios (prices, consumption) pairs with correlated noise."""
         n = len(price_mean)
+        scenarios = []
         for _ in range(self.n_scenarios):
-            # ── Draw temporally correlated noise ─────────────────────────────
             if self.price_chol is not None and self.price_chol.shape[0] == n:
-                z = np.random.randn(n)
-                price_noise = price_std * (self.price_chol @ z)
+                price_noise = price_std * (self.price_chol @ np.random.randn(n))
             else:
                 price_noise = price_std * np.random.randn(n)
 
             if self.dla_chol is not None and self.dla_chol.shape[0] == n:
-                z = np.random.randn(n)
-                dla_noise = dla_std * (self.dla_chol @ z)
+                dla_noise = dla_std * (self.dla_chol @ np.random.randn(n))
             else:
                 dla_noise = dla_std * np.random.randn(n)
 
-            # Clip sampled prices to physical bounds; extreme outliers cause ECOS
-            # numerical failures (German day-ahead: historically −500 to 3000 EUR/MWh)
-            prices = np.clip(price_mean + price_noise, -500.0, 3000.0)
-
-            # # Consumption must be non-negative; cap at 5x the horizon mean as sanity bound
-            # max_consumption = max(np.mean(dla_mean) * 5, 1.0)
-            # consumption = np.clip(dla_mean + dla_noise, 0.0, max_consumption)
+            prices      = np.clip(price_mean + price_noise, -500.0, 3000.0)
             consumption = dla_mean + dla_noise
+            scenarios.append((prices, consumption))
+        return scenarios
 
+    def _mean_scenario(self, price_mean, dla_mean, current_soc, discharge_allowed):
+        """Deterministic LP on expected inputs — fastest option."""
+        result = self.optimize_single_scenario(
+            np.clip(price_mean, -500.0, 3000.0), dla_mean, current_soc, discharge_allowed
+        )
+        if result is None:
+            return None
+        return {
+            "expected_cost": result["cost"],
+            "cost_std":      0.0,
+            "avg_soc":       result["soc"],
+            "avg_charge":    result["charge"],
+            "avg_discharge": result["discharge"],
+        }
+
+    def _scenario_avg(self, price_mean, price_std, dla_mean, dla_std,
+                      current_soc, discharge_allowed):
+        """Solve one LP per scenario independently, then average schedules."""
+        scenarios = self._draw_scenarios(price_mean, price_std, dla_mean, dla_std)
+        costs, all_soc, all_charge, all_discharge = [], [], [], []
+        for prices, consumption in scenarios:
             result = self.optimize_single_scenario(
-                prices, consumption, current_soc, discharge_allowed=discharge_allowed
+                prices, consumption, current_soc, discharge_allowed
             )
             if result:
                 costs.append(result["cost"])
@@ -154,8 +193,92 @@ class StochasticOptimizer:
             return None
         return {
             "expected_cost": np.mean(costs),
-            "cost_std": np.std(costs),
-            "avg_soc": np.mean(all_soc, axis=0),
-            "avg_charge": np.mean(all_charge, axis=0),
+            "cost_std":      np.std(costs),
+            "avg_soc":       np.mean(all_soc, axis=0),
+            "avg_charge":    np.mean(all_charge, axis=0),
             "avg_discharge": np.mean(all_discharge, axis=0),
+        }
+
+    def _extensive_form(self, price_mean, price_std, dla_mean, dla_std,
+                        current_soc, discharge_allowed):
+        """Extensive-form stochastic LP.
+
+        All scenarios share a single first-stage schedule (charge/discharge for
+        every time step), which is what actually gets committed.  Each scenario
+        has its own SOC trajectory as a second-stage variable, so the SOC
+        constraints are enforced per-scenario rather than only on average.
+
+        Objective: minimise expected cost across all scenarios.
+          min  (1/S) Σ_s Σ_t price_t^s * (consumption_t^s + charge_t - discharge_t) / 1000
+        subject to:
+          per-scenario SOC dynamics and capacity bounds
+          shared power limits on charge / discharge
+        """
+        scenarios = self._draw_scenarios(price_mean, price_std, dla_mean, dla_std)
+        S = len(scenarios)
+        n = len(price_mean)
+
+        # First-stage (shared) decision variables
+        charge = cp.Variable(n, nonneg=True)
+        discharge = cp.Variable(n, nonneg=True) if discharge_allowed else None
+
+        # Second-stage: one SOC trajectory per scenario
+        soc_vars = [cp.Variable(n + 1, nonneg=True) for _ in range(S)]
+
+        total_cost = 0
+        constraints = []
+        for s, ((prices, consumption), soc) in enumerate(zip(scenarios, soc_vars)):
+            # SOC dynamics for scenario s
+            constraints.append(soc[0] == current_soc)
+            constraints.append(soc <= self.capacity)
+            for t in range(n):
+                if discharge_allowed:
+                    energy_delta = charge[t] * self.sqrt_eff - discharge[t] * self.inv_sqrt_eff
+                else:
+                    energy_delta = charge[t] * self.sqrt_eff
+                constraints.append(soc[t + 1] == soc[t] + energy_delta)
+
+            # Scenario cost
+            scenario_cost = cp.sum(cp.multiply(prices, consumption / 1000))
+            scenario_cost += cp.sum(cp.multiply(prices, charge / 1000)) * self.inv_sqrt_eff
+            if discharge_allowed:
+                scenario_cost -= cp.sum(cp.multiply(prices, discharge / 1000)) * self.inv_sqrt_eff
+            total_cost += scenario_cost
+
+        # Shared power limits
+        constraints += [charge <= self.max_power * 0.25]
+        if discharge_allowed:
+            constraints += [discharge <= self.max_power * 0.25]
+
+        problem = cp.Problem(cp.Minimize(total_cost / S), constraints)
+        problem.solve(solver=cp.ECOS, verbose=False)
+
+        if problem.status not in ["optimal", "optimal_inaccurate"]:
+            return None
+
+        charge_val    = np.array(charge.value).flatten()
+        discharge_val = np.array(discharge.value).flatten() if discharge_allowed else np.zeros(n)
+
+        # Reconstruct the shared SOC trajectory from the committed schedule
+        soc_traj = np.empty(n + 1)
+        soc_traj[0] = current_soc
+        for t in range(n):
+            delta = charge_val[t] * self.sqrt_eff - discharge_val[t] * self.inv_sqrt_eff
+            soc_traj[t + 1] = np.clip(soc_traj[t] + delta, 0, self.capacity)
+
+        # Expected cost: average per-scenario cost using committed schedule
+        scenario_costs = []
+        for prices, consumption in scenarios:
+            c = np.sum(prices * consumption / 1000)
+            c += np.sum(prices * charge_val / 1000) * self.inv_sqrt_eff
+            if discharge_allowed:
+                c -= np.sum(prices * discharge_val / 1000) * self.inv_sqrt_eff
+            scenario_costs.append(c)
+
+        return {
+            "expected_cost": np.mean(scenario_costs),
+            "cost_std":      np.std(scenario_costs),
+            "avg_soc":       soc_traj,
+            "avg_charge":    charge_val,
+            "avg_discharge": discharge_val,
         }
