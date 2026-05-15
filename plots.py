@@ -3,13 +3,13 @@ plots.py — Visualisation helpers for the stochastic battery optimisation pipel
 
 Two public functions:
   plot_predictions(...)  — time-series forecasts with aleatoric/epistemic bands
-  plot_optimization(...) — SOC trajectory, schedule, price vs SOC, cost comparison
+  plot_optimization(...) — price & SOC vs time, net power schedule, price-SOC-power scatter, cost bar
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-from config import BATTERY_CAPACITY_KWH
+from config import BATTERY_CAPACITY_KWH, BATTERY_MAX_POWER_KW
 
 
 # ── Prediction plots ──────────────────────────────────────────────────────────
@@ -113,76 +113,95 @@ def plot_optimization(
     baseline_cost,
     actual_optimized_cost,
 ):
-    """2×2 figure: SOC trajectory, charge/discharge schedule, price vs SOC, cost bar chart."""
+    """2×2 figure: price & SOC vs time, net power schedule, price-SOC-power scatter, cost bar chart."""
+    battery_color = "darkorange"
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     fig.suptitle(f"Week {week_num} 2023 — Optimization Results", fontsize=14, fontweight="bold")
 
-    # ── Gather committed SOC and schedule arrays ───────────────────────────────
+    # ── Gather committed arrays ────────────────────────────────────────────────
     soc_values, soc_times = [], []
     all_charge, all_discharge, charge_times = [], [], []
+    soc_at_step = []  # SOC at the start of each committed step (aligned with charge_times)
 
     for r_idx, r in enumerate(results):
         start_idx = result_times[r_idx]
-
-        # SOC: commit first step_interval+1 points (includes next SOC after last step)
         for t, soc in enumerate(r["avg_soc"][:step_interval + 1]):
             soc_times.append(start_idx + t)
             soc_values.append(soc)
-
-        # Schedule: commit first step_interval charge/discharge values
         for t in range(step_interval):
             charge_times.append(start_idx + t)
             all_charge.append(r["avg_charge"][t])
             all_discharge.append(r["avg_discharge"][t])
+            soc_at_step.append(r["avg_soc"][t])
 
-    soc_times_hours   = np.array(soc_times)   * 0.25
+    soc_times_hours    = np.array(soc_times)   * 0.25
     charge_times_hours = np.array(charge_times) * 0.25
 
-    # ── SOC trajectory ─────────────────────────────────────────────────────────
-    if soc_values:
-        axes[0, 0].plot(soc_times_hours, soc_values, "g-", linewidth=2)
-    axes[0, 0].axhline(BATTERY_CAPACITY_KWH, color="r", linestyle="--", alpha=0.5, label="Max")
-    axes[0, 0].axhline(0,                    color="r", linestyle="--", alpha=0.5, label="Min")
+    # ── (0,0) Price & SOC vs time (merged dual-axis) ───────────────────────────
+    axes[0, 0].plot(t_hours, price_actual, "steelblue", linewidth=1.5, label="Price (EUR/MWh)")
     axes[0, 0].set_xlabel("Hours")
-    axes[0, 0].set_ylabel("SOC (kWh)")
-    axes[0, 0].set_title("Battery State of Charge")
-    axes[0, 0].legend()
+    axes[0, 0].set_ylabel("EUR/MWh", color="steelblue")
+    axes[0, 0].tick_params(axis="y", labelcolor="steelblue")
+    axes[0, 0].set_title("Price & Battery SOC")
     axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].set_ylim(0, BATTERY_CAPACITY_KWH * 1.1)
+    if soc_values:
+        ax_soc = axes[0, 0].twinx()
+        ax_soc.plot(soc_times_hours, soc_values, color=battery_color, linewidth=2, label="SOC (kWh)")
+        ax_soc.axhline(BATTERY_CAPACITY_KWH, color="r", linestyle="--", alpha=0.4)
+        ax_soc.axhline(0,                    color="r", linestyle="--", alpha=0.4)
+        ax_soc.set_ylabel("SOC (kWh)", color=battery_color)
+        ax_soc.tick_params(axis="y", labelcolor=battery_color)
+        ax_soc.set_ylim(0, BATTERY_CAPACITY_KWH * 1.1)
+        lines  = axes[0, 0].get_lines() + ax_soc.get_lines()
+        labels = [l.get_label() for l in lines]
+        axes[0, 0].legend(lines, labels, loc="upper left", fontsize=8)
 
-    # ── Charge / discharge schedule ────────────────────────────────────────────
+    # ── (0,1) Net battery power schedule ──────────────────────────────────────
+    _first_plan = True
+    for r_idx, r in enumerate(results):
+        start_idx = result_times[r_idx]
+        plan_len  = len(r["avg_charge"])
+        plan_times_h = (np.arange(plan_len) + start_idx) * 0.25
+        net_plan  = r["avg_charge"] - r["avg_discharge"]
+        label_plan = "Planned (per MPC window)" if _first_plan else None
+        axes[0, 1].plot(plan_times_h, net_plan, color=battery_color, alpha=0.15,
+                        linewidth=1, label=label_plan)
+        _first_plan = False
     if all_charge:
-        axes[0, 1].fill_between(charge_times_hours, 0,  all_charge,
-                                color="green", alpha=0.5, label="Charge")
-        axes[0, 1].fill_between(charge_times_hours, 0, [-d for d in all_discharge],
-                                color="red",   alpha=0.5, label="Discharge")
+        net_realized = np.array(all_charge) - np.array(all_discharge)
+        axes[0, 1].plot(charge_times_hours, net_realized, color=battery_color,
+                        linewidth=1.8, label="Realized")
+    axes[0, 1].axhline(0, color="black", linewidth=0.6, alpha=0.4)
     axes[0, 1].set_xlabel("Hours")
-    axes[0, 1].set_ylabel("Power (kW)")
-    axes[0, 1].set_title("Battery Charge/Discharge Schedule")
-    axes[0, 1].legend()
+    axes[0, 1].set_ylabel("Net power (kW)  [+ = charge, − = discharge]")
+    axes[0, 1].set_title("Battery Net Power Schedule")
+    axes[0, 1].legend(fontsize=8)
     axes[0, 1].grid(True, alpha=0.3)
 
-    # ── Price vs SOC (dual-axis) ───────────────────────────────────────────────
-    axes[1, 0].plot(t_hours, price_actual, "b-", label="Price", linewidth=1.5)
-    if soc_values:
-        ax_soc = axes[1, 0].twinx()
-        ax_soc.plot(soc_times_hours, soc_values, "g--", linewidth=1.5, alpha=0.7, label="SOC")
-        ax_soc.set_ylabel("SOC (kWh)", color="green")
-        ax_soc.tick_params(axis="y", labelcolor="green")
-        ax_soc.set_ylim(0, BATTERY_CAPACITY_KWH * 1.1)
-    axes[1, 0].set_xlabel("Hours")
-    axes[1, 0].set_ylabel("EUR/MWh")
-    axes[1, 0].set_title("Price vs Battery SOC")
-    axes[1, 0].legend(loc="upper left")
+    # ── (1,0) Scatter: SOC vs price, colored by net power ─────────────────────
+    if soc_at_step:
+        soc_arr      = np.array(soc_at_step)
+        net_arr      = np.array(all_charge) - np.array(all_discharge)
+        price_at_step = price_actual[np.array(charge_times)]
+        clim = max(abs(net_arr.max()), abs(net_arr.min()), 1.0)
+        sc = axes[1, 0].scatter(
+            soc_arr, price_at_step, c=net_arr,
+            cmap="RdYlGn", s=18, alpha=0.75,
+            vmin=-clim, vmax=clim,
+        )
+        fig.colorbar(sc, ax=axes[1, 0], label="Net power (kW)  [+ charge / − discharge]")
+    axes[1, 0].set_xlabel("SOC (kWh)")
+    axes[1, 0].set_ylabel("Price (EUR/MWh)")
+    axes[1, 0].set_title("Price vs SOC (colored by net power)")
     axes[1, 0].grid(True, alpha=0.3)
 
-    # ── Cost comparison bar chart ──────────────────────────────────────────────
+    # ── (1,1) Cost comparison bar chart ───────────────────────────────────────
     savings   = baseline_cost - actual_optimized_cost
     pct_saved = 100 * savings / baseline_cost if baseline_cost else 0
     axes[1, 1].bar(
         ["Baseline\n(no battery)", "Optimized\n(with battery)"],
         [baseline_cost, actual_optimized_cost],
-        color=["gray", "green"], alpha=0.7,
+        color=["gray", battery_color], alpha=0.7,
     )
     axes[1, 1].set_ylabel("Cost (EUR)")
     axes[1, 1].set_title(f"Weekly Costs: {savings:.0f} EUR savings ({pct_saved:.1f}%)")
