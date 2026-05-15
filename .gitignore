@@ -50,6 +50,7 @@ outputs/
 
 # Images (generated outputs)
 imgs/
+*.png
 
 # IDE / editor
 .vscode/
