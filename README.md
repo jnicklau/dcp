@@ -1,4 +1,4 @@
-# Stochastic Battery Optimisation with Bayesian Neural Networks
+# DeepCarbPlanner
 
 Receding-horizon MPC battery scheduler that integrates probabilistic load and price forecasts with a stochastic LP. Uncertainty is modelled via MC Dropout or Bayes by Backprop; scenarios are drawn with temporally correlated noise (Cholesky decomposition of the residual correlation matrix).
 
