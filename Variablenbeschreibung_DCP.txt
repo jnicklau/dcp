@@ -9,6 +9,6 @@ Covariaten
 new_time: Zeitstempel,
 
 eventuell:
-dla_volume_out_m3_per_m,dla_master_ae1_pressure_bar,dla_volume_out_m3,
+dla_volume_out_m3_per_m,dla_master_ae1_pressure_bar,dla_volume_out_m3, (nur für 3 Wochen im November)
 ofen_zuschlaege_kg,ofen_metall_kg,ofen_abwaerme_nestle_5893_mw,ofen_abwaerme_energievernichtung_6004/05_mw,ofen_abwaerme_heizkessel_6300_mw,ofen_abwaerme_energievernichtung_6506-9_mw,
 pl2_kasten_anzahl,pl2_gießgewicht_kg,pl2_volume_m3_542000

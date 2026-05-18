@@ -21,8 +21,20 @@ BATTERY_ROUND_TRIP_EFFICIENCY = 0.90
 HORIZON_HOURS = 12                          # look-ahead window for the LP
 OPTIMIZATION_STEPS_PER_HOUR = 4            # 15-minute intervals
 N_SCENARIOS = 10                            # Monte-Carlo scenarios per LP solve
-OPT_FREQUENCY = 3 *4                    # re-optimize every 3 hours (12 steps)
-SO_MODE = "scenario_avg"                      # "extensive" or "scenario_avg" for better uncertainty handling (but slower)
+OPT_FREQUENCY = 3 * OPTIMIZATION_STEPS_PER_HOUR # re-optimize every (eg 3 hours (12 steps))
+
+# Optimisation mode — choose one:
+#   "extensive"         — hard SOC constraints, all scenarios share one schedule (recommended)
+#   "mean_scenario"     — single LP on scenario means (fastest, ignores uncertainty)
+#   "scenario_avg"      — independent LP per scenario, schedules averaged (legacy)
+#   "cvar"              — CVaR-relaxed SOC constraints at risk level RISK_EPSILON
+#   "scenario_approach" — auto-compute N via Campi-Garatti bound, hard constraints
+SO_MODE = "extensive"
+
+# ── Probabilistic constraint settings ────────────────────────────────────────
+# Used by SO_MODE "cvar" and "scenario_approach".
+RISK_EPSILON = 0.05   # max allowed SOC violation probability  (e.g. 0.05 = 5%)
+RISK_DELTA   = 0.10   # confidence level for Campi-Garatti N   (e.g. 0.01 = 99% confidence)
 
 # ── Model hyperparameters ─────────────────────────────────────────────────────
 HIDDEN_DIMS = [64, 64, 32]                 # BNN / MC-Dropout hidden layer sizes
