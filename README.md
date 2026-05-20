@@ -7,7 +7,7 @@ Receding-horizon MPC battery scheduler with probabilistic load and price forecas
 ## Quick start
 
 ```bash
-python -m venv .venv && .venv\Scripts\activate  # Windows
+        python -m venv .venv && .venv\Scripts\activate  # Windows
 pip install -r requirements.txt                 # Python 3.12.0
 
 python train_simple.py    # train BNNs, save weights + Cholesky matrices

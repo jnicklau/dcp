@@ -18,13 +18,14 @@ class StochasticOptimizer:
 
     Primary public API
     ------------------
-    sample_scenarios(price_mean, price_std, dla_mean, dla_std)
-        Draw N_SCENARIOS (prices, consumption) tuples using the Cholesky-correlated
-        Gaussian sampler.  Returns a plain list so any external source of scenarios
-        (normalizing flows, ensemble models, expert draws, …) can be used instead.
+    sample_scenarios(price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std)
+        Draw N_SCENARIOS (prices, consumption_dla, consumption_pl2) triples using the
+        Cholesky-correlated Gaussian sampler.  Returns a plain list so any external
+        source of scenarios (normalizing flows, ensemble models, …) can be used instead.
 
     optimize(scenarios, current_soc, discharge_allowed, mode, epsilon, delta)
-        Solve the battery scheduling LP given a list of (prices, consumption) tuples.
+        Solve the battery scheduling LP given a list of
+        (prices, consumption_dla, consumption_pl2) tuples.
         Modes:
           "extensive"         — hard SOC constraints, shared schedule (recommended)
           "mean_scenario"     — single LP on scenario means (fastest)
@@ -33,7 +34,7 @@ class StochasticOptimizer:
           "scenario_approach" — uses provided scenarios as the scenario-approach set;
                                 reports whether N satisfies the Campi-Garatti bound
 
-    optimize_from_stats(price_mean, price_std, dla_mean, dla_std, ...)
+    optimize_from_stats(price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std, ...)
         Calls sample_scenarios then optimize — preserves the original interface.
         For mode="scenario_approach" this auto-computes the required N via the
         Campi-Garatti bound and draws that many scenarios before solving.
@@ -50,6 +51,7 @@ class StochasticOptimizer:
         verbose=False,
         dla_chol=None,
         price_chol=None,
+        pl2_chol=None,
     ):
         self.capacity = battery_capacity
         self.max_power = max_power
@@ -61,16 +63,17 @@ class StochasticOptimizer:
         self.verbose = verbose
         self.dla_chol = dla_chol    # Cholesky of residual correlation matrix
         self.price_chol = price_chol
+        self.pl2_chol = pl2_chol
 
     # ── Single-scenario LP ────────────────────────────────────────────────────
 
     def optimize_single_scenario(
-        self, prices, consumption, current_soc, discharge_allowed=False
+        self, prices, consumption_dla, consumption_pl2, current_soc, discharge_allowed=False
     ):
-        """Solve one LP for a deterministic (price, consumption) scenario.
+        """Solve one LP for a deterministic (price, consumption_dla, consumption_pl2) scenario.
 
         Objective: minimise total energy cost over the horizon.
-          cost = Σ price_t * (consumption_t + charge_t - discharge_t) / 1000
+          cost = Σ price_t * ((consumption_dla_t + consumption_pl2_t - discharge_t) + charge_t) / 1000
 
         The round-trip efficiency η is split symmetrically as √η on each side:
           energy stored  = charge   * √η
@@ -83,7 +86,7 @@ class StochasticOptimizer:
         soc = cp.Variable(n + 1, nonneg=True)
 
         # Baseline consumption cost (price × energy in MWh)
-        cost = cp.sum(cp.multiply(prices, consumption / 1000))
+        cost = cp.sum(cp.multiply(prices, (consumption_dla + consumption_pl2) / 1000))
         # Charging raises cost (buy electricity to store, incur efficiency loss)
         cost += cp.sum(cp.multiply(prices, charge / 1000)) * self.inv_sqrt_eff
         if discharge_allowed:
@@ -93,7 +96,7 @@ class StochasticOptimizer:
         # SOC dynamics: soc[t+1] = soc[t] + sqrt_eff*charge[t] - discharge[t]/sqrt_eff
         constraints = [soc[0] == current_soc, soc <= self.capacity]
         for t in range(n):
-            constraints.append(charge[t] <= self.max_power * 0.25)  # 15-min power cap
+            constraints.append(charge[t] <= self.max_power * 0.25)   # kWh/step cap (100 kW × 0.25 h)
             if discharge_allowed:
                 constraints.append(discharge[t] <= self.max_power * 0.25)
                 energy_delta = (
@@ -119,15 +122,15 @@ class StochasticOptimizer:
 
     # ── Public scenario sampling ───────────────────────────────────────────────
 
-    def sample_scenarios(self, price_mean, price_std, dla_mean, dla_std):
-        """Draw self.n_scenarios (prices, consumption) pairs with correlated noise.
+    def sample_scenarios(self, price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std):
+        """Draw self.n_scenarios (prices, consumption_dla, consumption_pl2) triples.
 
         Returns
         -------
-        list of (prices, consumption) tuples, each a 1-D numpy array of length
-        horizon_steps.  Any external scenario source can produce the same format.
+        list of (prices, consumption_dla, consumption_pl2) tuples, each a 1-D numpy
+        array of length horizon_steps.
         """
-        return self._draw_scenarios(price_mean, price_std, dla_mean, dla_std)
+        return self._draw_scenarios(price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std)
 
     # ── Primary optimizer ─────────────────────────────────────────────────────
 
@@ -158,7 +161,8 @@ class StochasticOptimizer:
         elif mode == "mean_scenario":
             prices_mean = np.mean([s[0] for s in scenarios], axis=0)
             dla_mean    = np.mean([s[1] for s in scenarios], axis=0)
-            return self._mean_scenario(prices_mean, dla_mean, current_soc, discharge_allowed)
+            pl2_mean    = np.mean([s[2] for s in scenarios], axis=0)
+            return self._mean_scenario(prices_mean, dla_mean, pl2_mean, current_soc, discharge_allowed)
         elif mode == "scenario_avg":
             return self._scenario_avg(scenarios, current_soc, discharge_allowed)
         elif mode == "cvar":
@@ -182,7 +186,7 @@ class StochasticOptimizer:
     # ── Convenience wrapper (backwards compatible) ────────────────────────────
 
     def optimize_from_stats(
-        self, price_mean, price_std, dla_mean, dla_std,
+        self, price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std,
         current_soc, discharge_allowed=False, mode="extensive",
         epsilon=RISK_EPSILON, delta=RISK_DELTA,
     ):
@@ -195,19 +199,19 @@ class StochasticOptimizer:
         """
         if mode == "scenario_approach":
             return self._scenario_approach(
-                price_mean, price_std, dla_mean, dla_std,
+                price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std,
                 current_soc, discharge_allowed, epsilon, delta,
             )
-        scenarios = self.sample_scenarios(price_mean, price_std, dla_mean, dla_std)
+        scenarios = self.sample_scenarios(price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std)
         return self.optimize(scenarios, current_soc, discharge_allowed, mode, epsilon, delta)
 
     def stochastic_optimize(
-        self, price_mean, price_std, dla_mean, dla_std,
+        self, price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std,
         current_soc, discharge_allowed=False, verbose=False, mode="extensive",
     ):
         """Deprecated convenience wrapper — use optimize_from_stats() instead."""
         return self.optimize_from_stats(
-            price_mean, price_std, dla_mean, dla_std,
+            price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std,
             current_soc, discharge_allowed, mode,
         )
 
@@ -220,10 +224,11 @@ class StochasticOptimizer:
         where n_d = number of first-stage decision variables.
         """
         n_d = 2 * self.horizon_steps if discharge_allowed else self.horizon_steps
+        n_d = 2 # to be removed
         return int(np.ceil((2 / epsilon) * (np.log(1.0 / delta) + n_d)))
 
     def _scenario_approach(
-        self, price_mean, price_std, dla_mean, dla_std,
+        self, price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std,
         current_soc, discharge_allowed, epsilon, delta,
     ):
         """Draw Campi-Garatti N scenarios and solve the extensive-form LP.
@@ -235,7 +240,7 @@ class StochasticOptimizer:
         # Temporarily override n_scenarios to draw the required number
         orig_n = self.n_scenarios
         self.n_scenarios = n_required
-        scenarios = self._draw_scenarios(price_mean, price_std, dla_mean, dla_std)
+        scenarios = self._draw_scenarios(price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std)
         self.n_scenarios = orig_n
 
         if self.verbose:
@@ -252,8 +257,8 @@ class StochasticOptimizer:
 
     # ── Mode implementations ──────────────────────────────────────────────────
 
-    def _draw_scenarios(self, price_mean, price_std, dla_mean, dla_std):
-        """Draw self.n_scenarios (prices, consumption) pairs with correlated noise."""
+    def _draw_scenarios(self, price_mean, price_std, dla_mean, dla_std, pl2_mean, pl2_std):
+        """Draw self.n_scenarios (prices, consumption_dla, consumption_pl2) triples."""
         n = len(price_mean)
         scenarios = []
         for _ in range(self.n_scenarios):
@@ -267,15 +272,21 @@ class StochasticOptimizer:
             else:
                 dla_noise = dla_std * np.random.randn(n)
 
-            prices      = np.clip(price_mean + price_noise, -500.0, 3000.0)
-            consumption = dla_mean + dla_noise
-            scenarios.append((prices, consumption))
+            if self.pl2_chol is not None and self.pl2_chol.shape[0] == n:
+                pl2_noise = pl2_std * (self.pl2_chol @ np.random.randn(n))
+            else:
+                pl2_noise = pl2_std * np.random.randn(n)
+
+            prices          = np.clip(price_mean + price_noise, -500.0, 3000.0)
+            consumption_dla = dla_mean + dla_noise
+            consumption_pl2 = pl2_mean + pl2_noise
+            scenarios.append((prices, consumption_dla, consumption_pl2))
         return scenarios
 
-    def _mean_scenario(self, price_mean, dla_mean, current_soc, discharge_allowed):
+    def _mean_scenario(self, price_mean, dla_mean, pl2_mean, current_soc, discharge_allowed):
         """Deterministic LP on expected inputs — fastest option."""
         result = self.optimize_single_scenario(
-            np.clip(price_mean, -500.0, 3000.0), dla_mean, current_soc, discharge_allowed
+            np.clip(price_mean, -500.0, 3000.0), dla_mean, pl2_mean, current_soc, discharge_allowed
         )
         if result is None:
             return None
@@ -290,9 +301,9 @@ class StochasticOptimizer:
     def _scenario_avg(self, scenarios, current_soc, discharge_allowed):
         """Solve one LP per scenario independently, then average schedules."""
         costs, all_soc, all_charge, all_discharge = [], [], [], []
-        for prices, consumption in scenarios:
+        for prices, consumption_dla, consumption_pl2 in scenarios:
             result = self.optimize_single_scenario(
-                prices, consumption, current_soc, discharge_allowed
+                prices, consumption_dla, consumption_pl2, current_soc, discharge_allowed
             )
             if result:
                 costs.append(result["cost"])
@@ -333,9 +344,19 @@ class StochasticOptimizer:
         # Second-stage: one SOC trajectory per scenario
         soc_vars = [cp.Variable(n + 1, nonneg=True) for _ in range(S)]
 
-        total_cost = 0
+        # Vectorised objective: factor out shared charge/discharge variables
+        prices_mat   = np.array([s[0] for s in scenarios])       # (S, n)
+        cons_dla_mat = np.array([s[1] for s in scenarios])       # (S, n)
+        cons_pl2_mat = np.array([s[2] for s in scenarios])       # (S, n)
+        mean_prices  = prices_mat.mean(axis=0)                   # (n,)
+        baseline     = float(np.sum(prices_mat * (cons_dla_mat + cons_pl2_mat)) / (1000 * S))
+
+        total_cost = baseline + (mean_prices / 1000) @ charge * self.inv_sqrt_eff
+        if discharge_allowed:
+            total_cost -= (mean_prices / 1000) @ discharge * self.inv_sqrt_eff
+
         constraints = []
-        for s, ((prices, consumption), soc) in enumerate(zip(scenarios, soc_vars)):
+        for s, ((prices, consumption_dla, consumption_pl2), soc) in enumerate(zip(scenarios, soc_vars)):
             # SOC dynamics for scenario s
             constraints.append(soc[0] == current_soc)
             constraints.append(soc <= self.capacity)
@@ -346,19 +367,12 @@ class StochasticOptimizer:
                     energy_delta = charge[t] * self.sqrt_eff
                 constraints.append(soc[t + 1] == soc[t] + energy_delta)
 
-            # Scenario cost
-            scenario_cost = cp.sum(cp.multiply(prices, consumption / 1000))
-            scenario_cost += cp.sum(cp.multiply(prices, charge / 1000)) * self.inv_sqrt_eff
-            if discharge_allowed:
-                scenario_cost -= cp.sum(cp.multiply(prices, discharge / 1000)) * self.inv_sqrt_eff
-            total_cost += scenario_cost
-
         # Shared power limits
         constraints += [charge <= self.max_power * 0.25]
         if discharge_allowed:
             constraints += [discharge <= self.max_power * 0.25]
 
-        problem = cp.Problem(cp.Minimize(total_cost / S), constraints)
+        problem = cp.Problem(cp.Minimize(total_cost), constraints)
         problem.solve(solver=cp.ECOS, verbose=False)
 
         if problem.status not in ["optimal", "optimal_inaccurate"]:
@@ -376,8 +390,8 @@ class StochasticOptimizer:
 
         # Expected cost: average per-scenario cost using committed schedule
         scenario_costs = []
-        for prices, consumption in scenarios:
-            c = np.sum(prices * consumption / 1000)
+        for prices, consumption_dla, consumption_pl2 in scenarios:
+            c = np.sum(prices * (consumption_dla + consumption_pl2) / 1000)
             c += np.sum(prices * charge_val / 1000) * self.inv_sqrt_eff
             if discharge_allowed:
                 c -= np.sum(prices * discharge_val / 1000) * self.inv_sqrt_eff
@@ -423,10 +437,20 @@ class StochasticOptimizer:
         xi_up  = cp.Variable((S, n + 1), nonneg=True)     # upper exceedance
         xi_lo  = cp.Variable((S, n + 1), nonneg=True)     # lower exceedance
 
-        total_cost  = 0
+        # Vectorised objective: factor out shared charge/discharge variables
+        prices_mat   = np.array([s[0] for s in scenarios])       # (S, n)
+        cons_dla_mat = np.array([s[1] for s in scenarios])       # (S, n)
+        cons_pl2_mat = np.array([s[2] for s in scenarios])       # (S, n)
+        mean_prices  = prices_mat.mean(axis=0)                   # (n,)
+        baseline     = float(np.sum(prices_mat * (cons_dla_mat + cons_pl2_mat)) / (1000 * S))
+
+        total_cost = baseline + (mean_prices / 1000) @ charge * self.inv_sqrt_eff
+        if discharge_allowed:
+            total_cost -= (mean_prices / 1000) @ discharge * self.inv_sqrt_eff
+
         constraints = []
 
-        for s, ((prices, consumption), soc) in enumerate(zip(scenarios, soc_vars)):
+        for s, ((prices, consumption_dla, consumption_pl2), soc) in enumerate(zip(scenarios, soc_vars)):
             constraints.append(soc[0] == current_soc)
             for t in range(n):
                 if discharge_allowed:
@@ -439,12 +463,6 @@ class StochasticOptimizer:
             constraints.append(xi_up[s] >= soc - self.capacity - eta_up)
             constraints.append(xi_lo[s] >= -soc - eta_lo)
 
-            scenario_cost  = cp.sum(cp.multiply(prices, consumption / 1000))
-            scenario_cost += cp.sum(cp.multiply(prices, charge / 1000)) * self.inv_sqrt_eff
-            if discharge_allowed:
-                scenario_cost -= cp.sum(cp.multiply(prices, discharge / 1000)) * self.inv_sqrt_eff
-            total_cost += scenario_cost
-
         # CVaR constraints: expected tail excess <= 0
         constraints.append(eta_up + cp.sum(xi_up, axis=0) / (epsilon * S) <= 0)
         constraints.append(eta_lo + cp.sum(xi_lo, axis=0) / (epsilon * S) <= 0)
@@ -454,7 +472,7 @@ class StochasticOptimizer:
         if discharge_allowed:
             constraints += [discharge <= self.max_power * 0.25]
 
-        problem = cp.Problem(cp.Minimize(total_cost / S), constraints)
+        problem = cp.Problem(cp.Minimize(total_cost), constraints)
         problem.solve(solver=cp.ECOS, verbose=False)
 
         if problem.status not in ["optimal", "optimal_inaccurate"]:
@@ -470,8 +488,8 @@ class StochasticOptimizer:
             soc_traj[t + 1] = np.clip(soc_traj[t] + delta, 0, self.capacity)
 
         scenario_costs = []
-        for prices, consumption in scenarios:
-            c  = np.sum(prices * consumption / 1000)
+        for prices, consumption_dla, consumption_pl2 in scenarios:
+            c  = np.sum(prices * (consumption_dla + consumption_pl2) / 1000)
             c += np.sum(prices * charge_val / 1000) * self.inv_sqrt_eff
             if discharge_allowed:
                 c -= np.sum(prices * discharge_val / 1000) * self.inv_sqrt_eff

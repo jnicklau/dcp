@@ -71,6 +71,7 @@ def merge_datasets(fundium_path, price_path):
 
     dla_cols = [
         "dla_stromverbrauch_kwh",
+        "pl2_stromverbrauch_kwh",
         "dla_volume_out_m3_per_m",
         "dla_master_ae1_pressure_bar",
         "dla_volume_out_m3",
@@ -84,7 +85,7 @@ def merge_datasets(fundium_path, price_path):
     merged["renewable_gen_mw"] = merged["renewable_gen_mw"].ffill().bfill()
     merged["load_mw"] = merged["load_mw"].ffill().bfill()
 
-    return merged.dropna(subset=["dla_stromverbrauch_kwh", "price_eur_mwh", "ofen_abwaerme_nestle_5893_mw"])
+    return merged.dropna(subset=["dla_stromverbrauch_kwh", "pl2_stromverbrauch_kwh", "price_eur_mwh", "ofen_abwaerme_nestle_5893_mw"])
 
 
 class DLADataset(Dataset):

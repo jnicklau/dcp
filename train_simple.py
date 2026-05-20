@@ -266,8 +266,9 @@ def calculate_metrics(y_actual, y_pred, mu_std, sigma_mean, confidence=0.95):
 
 def prepare_data(merged_df):
     time_feats = get_time_features(merged_df["new_time"])
-    dla_target = merged_df["dla_stromverbrauch_kwh"].values
-    price_target = merged_df["price_eur_mwh"].values
+    dla_target      = merged_df["dla_stromverbrauch_kwh"].values
+    pl2_target      = merged_df["pl2_stromverbrauch_kwh"].values
+    price_target    = merged_df["price_eur_mwh"].values
     abwaerme_target = merged_df["ofen_abwaerme_nestle_5893_mw"].values
 
     renewable = merged_df["renewable_gen_mw"].values
@@ -285,8 +286,9 @@ def prepare_data(merged_df):
         s = pd.Series(vals)
         return np.column_stack([s.shift(lag).ffill().bfill().values for lag in lag_steps])
 
-    dla_lags = make_lags(dla_target, DLA_LAG_STEPS)
-    price_lags = make_lags(price_target, PRICE_LAG_STEPS)
+    dla_lags      = make_lags(dla_target,      DLA_LAG_STEPS)
+    pl2_lags      = make_lags(pl2_target,      PL2_LAG_STEPS)
+    price_lags    = make_lags(price_target,    PRICE_LAG_STEPS)
     abwaerme_lags = make_lags(abwaerme_target, ABWAERME_LAG_STEPS)
 
     train_size = int(len(merged_df) * TRAIN_SPLIT)
@@ -297,22 +299,26 @@ def prepare_data(merged_df):
             "market_feats": market_feats[:train_size],
             "market_feats_mean": market_feats_mean,
             "market_feats_std": market_feats_std,
-            "dla_target": dla_target[:train_size],
-            "dla_lags": dla_lags[:train_size],
-            "price_target": price_target[:train_size],
-            "price_lags": price_lags[:train_size],
+            "dla_target":      dla_target[:train_size],
+            "dla_lags":        dla_lags[:train_size],
+            "pl2_target":      pl2_target[:train_size],
+            "pl2_lags":        pl2_lags[:train_size],
+            "price_target":    price_target[:train_size],
+            "price_lags":      price_lags[:train_size],
             "abwaerme_target": abwaerme_target[:train_size],
-            "abwaerme_lags": abwaerme_lags[:train_size],
+            "abwaerme_lags":   abwaerme_lags[:train_size],
         },
         {
             "time": time_feats.values[train_size:],
             "market_feats": market_feats[train_size:],
-            "dla_target": dla_target[train_size:],
-            "dla_lags": dla_lags[train_size:],
-            "price_target": price_target[train_size:],
-            "price_lags": price_lags[train_size:],
+            "dla_target":      dla_target[train_size:],
+            "dla_lags":        dla_lags[train_size:],
+            "pl2_target":      pl2_target[train_size:],
+            "pl2_lags":        pl2_lags[train_size:],
+            "price_target":    price_target[train_size:],
+            "price_lags":      price_lags[train_size:],
             "abwaerme_target": abwaerme_target[train_size:],
-            "abwaerme_lags": abwaerme_lags[train_size:],
+            "abwaerme_lags":   abwaerme_lags[train_size:],
         },
         train_size,
     )
@@ -322,14 +328,18 @@ def main():
     print("=" * 60)
     print("DLA Stochastic Optimization - Training")
     print("=" * 60)
+    N_tasks = 8
+    i = 1
     method_label = "Bayes by Backprop (true BNN)" if UNCERTAINTY_METHOD == "bnn" else "MC Dropout"
     print(f"  Uncertainty method: {method_label}")
 
-    print("\n[1/5] Loading data...")
+    print(f"\n[{i}/{N_tasks}] Loading data...")
+    i += 1
     merged = merge_datasets(FUNDIUM_DATA_PATH, PRICE_DATA_PATH)
     print(f"  Merged dataset: {merged.shape[0]} samples")
 
-    print("\n[2/5] Preparing train/test split...")
+    print(f"\n[{i}/{N_tasks}] Preparing train/test split...")
+    i += 1
     train_data, test_data, train_size = prepare_data(merged)
     print(
         f"  Train: {len(train_data['time'])} samples, Test: {len(test_data['time'])} samples"
@@ -342,8 +352,10 @@ def main():
     print(f"  DLA: mean={dla_mean:.1f} kWh, std={dla_std:.1f} kWh")
     print(f"  price: mean={train_data['price_target'].mean():.1f} €/MWh, std={train_data['price_target'].std():.1f} €/MWh")
     print(f"  abwaerme: mean={train_data['abwaerme_target'].mean():.1f} MW, std={train_data['abwaerme_target'].std():.1f} MW")
+    print(f"  PL2: mean={train_data['pl2_target'].mean():.1f} kWh, std={train_data['pl2_target'].std():.1f} kWh")
 
-    print(f"\n[3/5] Training DLA {UNCERTAINTY_METHOD} (Gaussian NLL in original space)...")
+    print(f"\n[{i}/{N_tasks}] Training DLA {UNCERTAINTY_METHOD} (Gaussian NLL in original space)...")
+    i += 1
     dla_lags_norm = (train_data["dla_lags"] - dla_mean) / dla_std
     dla_input = np.hstack([train_data["time"], dla_lags_norm])
     dla_input_dim = 6 + len(DLA_LAG_STEPS)
@@ -361,7 +373,8 @@ def main():
     torch.save(dla_bnn.state_dict(), f"{MODELS_DIR}/dla_bnn.pt")
     np.savez(f"{NORMS_DIR}/dla_norm.npz", mean=dla_mean, std=dla_std)
 
-    print(f"\n[4/5] Training Price {UNCERTAINTY_METHOD} (with renewable + load features)...")
+    print(f"\n[{i}/{N_tasks}] Training Price {UNCERTAINTY_METHOD} (with renewable + load features)...")
+    i += 1
     price_mean = train_data["price_target"].mean()
     price_std  = train_data["price_target"].std()
     price_targets = (train_data["price_target"] - price_mean) / price_std
@@ -389,7 +402,8 @@ def main():
     )
     print(f"  Price: mean={price_mean:.2f} EUR/MWh, std={price_std:.2f} EUR/MWh")
 
-    print(f"\n[5/6] Training Abwaerme {UNCERTAINTY_METHOD}...")
+    print(f"\n[{i}/{N_tasks}] Training Abwaerme {UNCERTAINTY_METHOD}...")
+    i += 1
     abwaerme_mean = train_data["abwaerme_target"].mean()
     abwaerme_std = train_data["abwaerme_target"].std()
     abwaerme_train_norm = (train_data["abwaerme_target"] - abwaerme_mean) / abwaerme_std
@@ -411,12 +425,37 @@ def main():
     np.savez(f"{NORMS_DIR}/abwaerme_norm.npz", mean=abwaerme_mean, std=abwaerme_std)
     print(f"  Abwaerme: mean={abwaerme_mean:.3f} MW, std={abwaerme_std:.3f} MW")
 
-    print("\n[6/6] Plotting training losses...")
+    print(f"\n[{i}/{N_tasks}] Training PL2 {UNCERTAINTY_METHOD}...")
+    i += 1
+    pl2_mean = train_data["pl2_target"].mean()
+    pl2_std  = train_data["pl2_target"].std()
+    pl2_train_norm = (train_data["pl2_target"] - pl2_mean) / pl2_std
+
+    pl2_lags_norm = (train_data["pl2_lags"] - pl2_mean) / pl2_std
+    pl2_input = np.hstack([train_data["time"], pl2_lags_norm])
+    pl2_input_dim = 6 + len(PL2_LAG_STEPS)
+    print(f"  Input dim: {pl2_input_dim} (6 time + {len(PL2_LAG_STEPS)} lags at steps {PL2_LAG_STEPS})")
+
+    pl2_dataset = TensorDataset(
+        torch.tensor(pl2_input, dtype=torch.float32),
+        torch.tensor(pl2_train_norm, dtype=torch.float32),
+    )
+    pl2_loader = DataLoader(pl2_dataset, batch_size=256, shuffle=True)
+
+    pl2_bnn = make_gaussian_net(pl2_input_dim, HIDDEN_DIMS, init_noise=0.5)
+    pl2_bnn, pl2_losses = train_model_nll(pl2_bnn, pl2_loader, name=f"PL2 {UNCERTAINTY_METHOD}")
+    torch.save(pl2_bnn.state_dict(), f"{MODELS_DIR}/pl2_bnn.pt")
+    np.savez(f"{NORMS_DIR}/pl2_norm.npz", mean=pl2_mean, std=pl2_std)
+    print(f"  PL2: mean={pl2_mean:.1f} kWh, std={pl2_std:.1f} kWh")
+
+    print(f"\n[{i}/{N_tasks}] Plotting training losses...")
+    i += 1
     fig, ax = plt.subplots(figsize=(10, 6))
     epochs = range(1, len(dla_losses) + 1)
-    ax.plot(epochs, dla_losses, "b-", label="DLA BNN", linewidth=2)
-    ax.plot(epochs, price_losses, "r-", label="Price BNN", linewidth=2)
+    ax.plot(epochs, dla_losses,      "b-", label="DLA BNN",      linewidth=2)
+    ax.plot(epochs, price_losses,    "r-", label="Price BNN",    linewidth=2)
     ax.plot(epochs, abwaerme_losses, "g-", label="Abwaerme BNN", linewidth=2)
+    ax.plot(epochs, pl2_losses,      "m-", label="PL2 BNN",      linewidth=2)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("NLL Loss")
     ax.set_title("Training Loss Curves")
@@ -426,7 +465,8 @@ def main():
     plt.savefig("training_loss.png", dpi=150)
     print(f"  Saved to: training_loss.png")
 
-    print("\n[5/5] Test Set Evaluation...")
+    print(f"\n[{i}/{N_tasks}] Calculating Evaluation Metrics...")
+    i += 1
     print("-" * 60)
 
     test_dla_lags_norm = (test_data["dla_lags"] - dla_mean) / dla_std
@@ -442,12 +482,12 @@ def main():
     dla_mu_std = dla_mu_std * dla_std
 
     dla_metrics = calculate_metrics(test_dla_y, dla_mu, dla_mu_std, dla_sigma)
-    print("\nDLA Consumption Test Metrics:")
-    print(f"  RMSE:      {dla_metrics['rmse']:.2f} kWh")
-    print(f"  MAE:       {dla_metrics['mae']:.2f} kWh")
-    print(f"  MAPE:      {dla_metrics['mape']:.1f}%")
-    print(f"  Coverage:  {dla_metrics['coverage']:.1f}% (95% CI)")
-    print(f"  Total Std: {dla_metrics['total_std_mean']:.2f} kWh")
+    # print("\nDLA Consumption Test Metrics:")
+    # print(f"  RMSE:      {dla_metrics['rmse']:.2f} kWh")
+    # print(f"  MAE:       {dla_metrics['mae']:.2f} kWh")
+    # print(f"  MAPE:      {dla_metrics['mape']:.1f}%")
+    # print(f"  Coverage:  {dla_metrics['coverage']:.1f}% (95% CI)")
+    # print(f"  Total Std: {dla_metrics['total_std_mean']:.2f} kWh")
 
     test_price_lags_norm = (test_data["price_lags"] - price_mean) / price_std
     test_price_features = np.hstack([test_data["time"], test_data["market_feats"], test_price_lags_norm])
@@ -462,12 +502,12 @@ def main():
     price_mu_std = price_mu_std_norm * price_std
 
     price_metrics = calculate_metrics(test_price_y, price_mu, price_mu_std, price_sigma)
-    print("\nPrice Day-Ahead Test Metrics:")
-    print(f"  RMSE:      {price_metrics['rmse']:.2f} EUR/MWh")
-    print(f"  MAE:       {price_metrics['mae']:.2f} EUR/MWh")
-    print(f"  MAPE:      {price_metrics['mape']:.1f}%")
-    print(f"  Coverage:  {price_metrics['coverage']:.1f}% (95% CI)")
-    print(f"  Total Std: {price_metrics['total_std_mean']:.2f} EUR/MWh")
+    # print("\nPrice Day-Ahead Test Metrics:")
+    # print(f"  RMSE:      {price_metrics['rmse']:.2f} EUR/MWh")
+    # print(f"  MAE:       {price_metrics['mae']:.2f} EUR/MWh")
+    # print(f"  MAPE:      {price_metrics['mape']:.1f}%")
+    # print(f"  Coverage:  {price_metrics['coverage']:.1f}% (95% CI)")
+    # print(f"  Total Std: {price_metrics['total_std_mean']:.2f} EUR/MWh")
 
     test_abwaerme_lags_norm = (test_data["abwaerme_lags"] - abwaerme_mean) / abwaerme_std
     test_abwaerme_input = np.hstack([test_data["time"], test_abwaerme_lags_norm])
@@ -482,15 +522,44 @@ def main():
     abwaerme_mu_std = abwaerme_mu_std * abwaerme_std
 
     abwaerme_metrics = calculate_metrics(test_abwaerme_y, abwaerme_mu, abwaerme_mu_std, abwaerme_sigma)
-    print("\nAbwaerme Nestle Test Metrics:")
-    print(f"  RMSE:      {abwaerme_metrics['rmse']:.4f} MW")
-    print(f"  MAE:       {abwaerme_metrics['mae']:.4f} MW")
-    print(f"  MAPE:      {abwaerme_metrics['mape']:.1f}%")
-    print(f"  Coverage:  {abwaerme_metrics['coverage']:.1f}% (95% CI)")
-    print(f"  Total Std: {abwaerme_metrics['total_std_mean']:.4f} MW")
+    # print("\nAbwaerme Nestle Test Metrics:")
+    # print(f"  RMSE:      {abwaerme_metrics['rmse']:.4f} MW")
+    # print(f"  MAE:       {abwaerme_metrics['mae']:.4f} MW")
+    # print(f"  MAPE:      {abwaerme_metrics['mape']:.1f}%")
+    # print(f"  Coverage:  {abwaerme_metrics['coverage']:.1f}% (95% CI)")
+    # print(f"  Total Std: {abwaerme_metrics['total_std_mean']:.4f} MW")
+
+    test_pl2_lags_norm = (test_data["pl2_lags"] - pl2_mean) / pl2_std
+    test_pl2_input = np.hstack([test_data["time"], test_pl2_lags_norm])
+    test_pl2_x = torch.tensor(test_pl2_input, dtype=torch.float32)
+    test_pl2_y = test_data["pl2_target"]
+
+    pl2_mu_norm, pl2_sigma_norm, pl2_mu_std, _ = pl2_bnn.predict(
+        test_pl2_x, n_samples=NUM_MC_SAMPLES
+    )
+    pl2_mu     = pl2_mu_norm * pl2_std + pl2_mean
+    pl2_sigma  = pl2_sigma_norm * pl2_std
+    pl2_mu_std = pl2_mu_std * pl2_std
+
+    pl2_metrics = calculate_metrics(test_pl2_y, pl2_mu, pl2_mu_std, pl2_sigma)
+    # print("\nPL2 Consumption Test Metrics:")
+    # print(f"  RMSE:      {pl2_metrics['rmse']:.2f} kWh")
+    # print(f"  MAE:       {pl2_metrics['mae']:.2f} kWh")
+    # print(f"  MAPE:      {pl2_metrics['mape']:.1f}%")
+    # print(f"  Coverage:  {pl2_metrics['coverage']:.1f}% (95% CI)")
+    # print(f"  Total Std: {pl2_metrics['total_std_mean']:.2f} kWh")
 
     print("\n" + "=" * 60)
     print("Training complete! Models saved.")
+    print("=" * 60)
+    print("\nTest Set Prognosis Quality Summary")
+    print("-" * 60)
+    print(f"  {'Signal':<20}  {'RMSE':>10}  {'MAE':>10}  {'MAPE':>7}  {'Cov.':>6}")
+    print(f"  {'-'*20}  {'-'*10}  {'-'*10}  {'-'*7}  {'-'*6}")
+    print(f"  {'DLA [kWh]':<20}  {dla_metrics['rmse']:>10.2f}  {dla_metrics['mae']:>10.2f}  {dla_metrics['mape']:>6.1f}%  {dla_metrics['coverage']:>5.1f}%")
+    print(f"  {'PL2 [kWh]':<20}  {pl2_metrics['rmse']:>10.2f}  {pl2_metrics['mae']:>10.2f}  {pl2_metrics['mape']:>6.1f}%  {pl2_metrics['coverage']:>5.1f}%")
+    print(f"  {'Price [EUR/MWh]':<20}  {price_metrics['rmse']:>10.2f}  {price_metrics['mae']:>10.2f}  {price_metrics['mape']:>6.1f}%  {price_metrics['coverage']:>5.1f}%")
+    print(f"  {'Abwaerme [MW]':<20}  {abwaerme_metrics['rmse']:>10.4f}  {abwaerme_metrics['mae']:>10.4f}  {abwaerme_metrics['mape']:>6.1f}%  {abwaerme_metrics['coverage']:>5.1f}%")
     print("=" * 60)
 
     print("\n[Post-training] Estimating residual correlation matrices...")
@@ -527,6 +596,22 @@ def main():
     price_chol = estimate_residual_correlations(price_residuals_tr, price_total_std_tr, horizon_steps)
     np.savez(f"{NORMS_DIR}/price_chol.npz", L=price_chol)
     print(f"  Price correlation matrix estimated from {len(price_residuals_tr)} samples")
+
+    # PL2 correlations on training data
+    train_pl2_lags_norm = (train_data["pl2_lags"] - pl2_mean) / pl2_std
+    train_pl2_input = np.hstack([train_data["time"], train_pl2_lags_norm])
+    train_pl2_x = torch.tensor(train_pl2_input, dtype=torch.float32)
+    pl2_mu_tr_norm, pl2_sigma_tr_norm, pl2_mu_std_tr, _ = pl2_bnn.predict(
+        train_pl2_x, n_samples=NUM_MC_SAMPLES
+    )
+    pl2_mu_tr     = pl2_mu_tr_norm * pl2_std + pl2_mean
+    pl2_sigma_tr  = pl2_sigma_tr_norm * pl2_std
+    pl2_mu_std_tr = pl2_mu_std_tr * pl2_std
+    pl2_total_std_tr = np.sqrt(pl2_mu_std_tr**2 + pl2_sigma_tr**2)
+    pl2_residuals_tr = train_data["pl2_target"] - pl2_mu_tr
+    pl2_chol = estimate_residual_correlations(pl2_residuals_tr, pl2_total_std_tr, horizon_steps)
+    np.savez(f"{NORMS_DIR}/pl2_chol.npz", L=pl2_chol)
+    print(f"  PL2 correlation matrix estimated from {len(pl2_residuals_tr)} samples")
     print(f"  Cholesky factors saved to {NORMS_DIR}/")
 
 

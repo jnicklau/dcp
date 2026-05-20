@@ -15,18 +15,18 @@ from config import BATTERY_CAPACITY_KWH, BATTERY_MAX_POWER_KW
 # ── Prediction plots ──────────────────────────────────────────────────────────
 
 def plot_predictions(
-    week_num,
+    period_label,
     t_hours,
     dla_actual, dla_mu, dla_sigma, dla_total_std, dla_metrics,
     price_actual, price_mu, price_sigma, price_total_std, price_metrics,
-    abwaerme_actual, abwaerme_mu, abwaerme_sigma, abwaerme_total_std, abwaerme_metrics,
+    pl2_actual, pl2_mu, pl2_sigma, pl2_total_std, pl2_metrics,
 ):
-    """3×2 figure: time-series forecasts + predicted-vs-actual scatter for DLA, price, Abwärme.
+    """3×2 figure: time-series forecasts + predicted-vs-actual scatter for DLA, price, PL2.
 
     Orange band = aleatoric (95%), red band extension = epistemic (95%).
     """
     fig, axes = plt.subplots(3, 2, figsize=(14, 13))
-    fig.suptitle(f"Week {week_num} 2023 — Predictions", fontsize=14, fontweight="bold")
+    fig.suptitle(f"{period_label} — Predictions", fontsize=14, fontweight="bold")
 
     # ── DLA ───────────────────────────────────────────────────────────────────
     _plot_series_row(
@@ -48,18 +48,18 @@ def plot_predictions(
         scatter_xlabel="Actual (EUR/MWh)", scatter_ylabel="Predicted (EUR/MWh)",
     )
 
-    # ── Abwärme ────────────────────────────────────────────────────────────────
+    # ── PL2 ────────────────────────────────────────────────────────────────────────
     _plot_series_row(
         axes[2], t_hours,
-        abwaerme_actual, abwaerme_mu, abwaerme_sigma, abwaerme_total_std,
-        label_y="MW", title="Abwärme Nestlé (ofen_abwaerme_nestle_5893_mw)",
+        pl2_actual, pl2_mu, pl2_sigma, pl2_total_std,
+        label_y="kWh", title="PL2 Power Consumption",
         scatter_color="purple",
-        scatter_title=f"Abwärme Predicted vs Actual (RMSE={abwaerme_metrics['rmse']:.4f} MW)",
-        scatter_xlabel="Actual (MW)", scatter_ylabel="Predicted (MW)",
+        scatter_title=f"PL2 Predicted vs Actual (RMSE={pl2_metrics['rmse']:.1f} kWh)",
+        scatter_xlabel="Actual (kWh)", scatter_ylabel="Predicted (kWh)",
     )
 
     fig.tight_layout()
-    path = f"week{week_num}_predictions.png"
+    path = f"{period_label.replace(' ', '_').replace('/', '-')}_predictions.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Saved: {path}")
     plt.close(fig)
@@ -104,19 +104,23 @@ def _plot_series_row(
 # ── Optimization plots ────────────────────────────────────────────────────────
 
 def plot_optimization(
-    week_num,
+    period_label,
     t_hours,
     price_actual,
     results,
     result_times,
     step_interval,
     baseline_cost,
+    det_opt_cost,
     actual_optimized_cost,
+    optimizer_scenarios,
+
 ):
     """2×2 figure: price & SOC vs time, net power schedule, price-SOC-power scatter, cost bar chart."""
     battery_color = "darkorange"
+    plt.style.use("seaborn-v0_8-dark")
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    fig.suptitle(f"Week {week_num} 2023 — Optimization Results", fontsize=14, fontweight="bold")
+    fig.suptitle(f"{period_label} — Optimization Results", fontsize=14, fontweight="bold")
 
     # ── Gather committed arrays ────────────────────────────────────────────────
     soc_values, soc_times = [], []
@@ -162,13 +166,13 @@ def plot_optimization(
         start_idx = result_times[r_idx]
         plan_len  = len(r["avg_charge"])
         plan_times_h = (np.arange(plan_len) + start_idx) * 0.25
-        net_plan  = r["avg_charge"] - r["avg_discharge"]
+        net_plan  = (r["avg_charge"] - r["avg_discharge"]) * 4   # kWh/step → kW
         label_plan = "Planned (per MPC window)" if _first_plan else None
         axes[0, 1].plot(plan_times_h, net_plan, color=battery_color, alpha=0.15,
                         linewidth=1, label=label_plan)
         _first_plan = False
     if all_charge:
-        net_realized = np.array(all_charge) - np.array(all_discharge)
+        net_realized = (np.array(all_charge) - np.array(all_discharge)) * 4  # kWh/step → kW
         axes[0, 1].plot(charge_times_hours, net_realized, color=battery_color,
                         linewidth=1.8, label="Realized")
     axes[0, 1].axhline(0, color="black", linewidth=0.6, alpha=0.4)
@@ -181,7 +185,7 @@ def plot_optimization(
     # ── (1,0) Scatter: SOC vs price, colored by net power ─────────────────────
     if soc_at_step:
         soc_arr      = np.array(soc_at_step)
-        net_arr      = np.array(all_charge) - np.array(all_discharge)
+        net_arr      = (np.array(all_charge) - np.array(all_discharge)) * 4  # kWh/step → kW
         price_at_step = price_actual[np.array(charge_times)]
         clim = max(abs(net_arr.max()), abs(net_arr.min()), 1.0)
         sc = axes[1, 0].scatter(
@@ -196,21 +200,23 @@ def plot_optimization(
     axes[1, 0].grid(True, alpha=0.3)
 
     # ── (1,1) Cost comparison bar chart ───────────────────────────────────────
-    savings   = baseline_cost - actual_optimized_cost
-    pct_saved = 100 * savings / baseline_cost if baseline_cost else 0
-    axes[1, 1].bar(
-        ["Baseline\n(no battery)", "Optimized\n(with battery)"],
-        [baseline_cost, actual_optimized_cost],
-        color=["gray", battery_color], alpha=0.7,
-    )
+    labels = ["Baseline\n(no battery)", "Det. MPC\n(1 scenario)", f"Stoch. MPC\n({optimizer_scenarios} scenarios)"]
+    costs  = [baseline_cost, det_opt_cost, actual_optimized_cost]
+    colors = ["gray", "steelblue", battery_color]
+    bars   = axes[1, 1].bar(labels, costs, color=colors, alpha=0.7)
+    best   = min(costs)
+    savings_stoch = baseline_cost - actual_optimized_cost
+    pct_stoch     = 100 * savings_stoch / baseline_cost if baseline_cost else 0
     axes[1, 1].set_ylabel("Cost (EUR)")
-    axes[1, 1].set_title(f"Weekly Costs: {savings:.0f} EUR savings ({pct_saved:.1f}%)")
-    for i, cost in enumerate([baseline_cost, actual_optimized_cost]):
-        axes[1, 1].text(i, cost + max(abs(baseline_cost) * 0.01, 1), f"{cost:.0f}",
-                        ha="center", fontsize=10)
+    axes[1, 1].set_title(f"Costs — stoch. battery saves {savings_stoch:.0f} EUR ({pct_stoch:.1f}%)")
+    y_pad = max(abs(baseline_cost) * 0.01, 1)
+    for bar, cost in zip(bars, costs):
+        axes[1, 1].text(bar.get_x() + bar.get_width() / 2,
+                        cost + y_pad, f"{cost:.0f}",
+                        ha="center", fontsize=9)
 
     fig.tight_layout()
-    path = f"week{week_num}_optimization.png"
+    path = f"{period_label.replace(' ', '_').replace('/', '-')}_optimization.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Saved: {path}")
     plt.close(fig)
