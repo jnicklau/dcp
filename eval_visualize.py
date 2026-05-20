@@ -174,13 +174,19 @@ def make_predictions(week_data, dla_bnn, price_bnn, abwaerme_bnn, pl2_bnn, norms
 
 # ── Optimization ──────────────────────────────────────────────────────────────
 
-def run_optimization(preds):
+def run_optimization(preds, initial_soc=None):
     """
     MPC receding-horizon stochastic battery optimization.
 
     At each re-optimization step we solve N_SCENARIOS LP instances over the
     HORIZON_HOURS look-ahead, then commit only the first OPT_FREQUENCY steps
     (3 hours) before re-solving with updated predictions.
+
+    Parameters
+    ----------
+    initial_soc : float or None
+        Starting SOC in kWh. Defaults to INITIAL_SOC_KWH from config.
+        Pass the ending SOC of a previous run to chain periods together.
     """
     # Load Cholesky factors for temporally-correlated scenario sampling
     dla_chol_path   = f"{NORMS_DIR}/dla_chol.npz"
@@ -216,7 +222,7 @@ def run_optimization(preds):
     pl2_std    = preds["pl2"]["total_std"]   if "pl2" in preds else np.zeros_like(dla_std)
     pl2_actual = preds["pl2"]["actual"]      if "pl2" in preds else np.zeros_like(dla_actual)
 
-    current_soc = BATTERY_CAPACITY_KWH * 0.5
+    current_soc = INITIAL_SOC_KWH if initial_soc is None else float(initial_soc)
     results, result_times = [], []
     n_steps = len(price_mu) - optimizer.horizon_steps
 
@@ -246,7 +252,7 @@ def run_optimization(preds):
     print(f"  Optimized {len(results)} MPC steps")
 
     # ── Deterministic MPC baseline (one LP per step on forecast means) ──────
-    det_soc = BATTERY_CAPACITY_KWH * 0.5
+    det_soc = INITIAL_SOC_KWH if initial_soc is None else float(initial_soc)
     det_results, det_result_times = [], []
 
     for i in tqdm(range(0, n_steps, OPT_FREQUENCY), desc="Det. baseline"):

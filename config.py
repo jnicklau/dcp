@@ -25,6 +25,7 @@ EVAL_N_DAYS     = 1              # number of calendar days to evaluate
 BATTERY_CAPACITY_KWH = 500.0
 BATTERY_MAX_POWER_KW = 100.0
 BATTERY_ROUND_TRIP_EFFICIENCY = 0.9
+INITIAL_SOC_KWH = BATTERY_CAPACITY_KWH * 0.5  # starting SOC; override for rolling backtest
 
 # ── MPC / optimization ────────────────────────────────────────────────────────
 HORIZON_HOURS = 12                          # look-ahead window for the LP
